@@ -46,23 +46,24 @@ request, in-window cap reads, fault deltas), `s3_run.sh` (mirrored A/B/B/A drive
 ```
 score = (decode_t_s, prefill_t_s)   # long-lived-server protocol, varH-equivalent model
 gated by:  greedy token identity (kernel changes)  AND  paired PPL <= +0.5% (requantisation)
-target:    decode >= 8.61 t/s, prefill >= 11.98 t/s   (ik_llama.cpp oracle, same weights)
-baseline:  decode  6.90 t/s (median), prefill  8.40 t/s (mean)
+target:    decode >= 9.26 t/s, prefill >= 11.83 t/s   (ik oracle, RE-MEASURED Stage 9/10)
+baseline:  decode  6.945 t/s benched / 7.48 t/s warm in-app
+           prefill 8.68 t/s benched / 10.72 t/s cool-device
 ```
 
-| Component | Baseline | Oracle | What it measures |
+| Component | Baseline (Build 14) | Oracle (measured) | What it measures |
 |-----------|---------:|-------:|------------------|
-| **Decode t/s** | 6.90 | 8.61 (floor) | Steady-state token generation, long-lived server |
-| **Prefill t/s** | 8.40 | 11.98 (floor) | Prompt processing, 262-token prompt, same server |
+| **Decode t/s** | 6.945 benched · 7.48 warm in-app | **9.2564** | Steady-state token generation, long-lived server |
+| **Prefill t/s** | 8.68 benched · 10.72 cool | **11.8322** | Prompt processing, 262-token prompt, same server |
 | **Quality gate** | passes | — | Gate 1 token identity, Gate 2 paired PPL ≤ +0.5% (32 chunks), or Gate 3 for re-associated kernels |
 | **Host PPL (varH)** | 2.9036 | — | `llama-perplexity`, wikitext-2-raw, `-c 512 --chunks 32` |
 
-**The oracle figures are floors, not point targets.** Stage 5 measured ik at 8.61 decode / 11.98
-prefill while it ran with its **default 32 context checkpoints** (`ik common/common.h:587`) and our
-fork ran `-ctxcp 0`, so ik was paying checkpoint overhead that our engine was not. Tonight both
-engines run checkpointing off (`--ctx-checkpoints 0` on ik, `-ctxcp 0` on ours), which can only move
-ik's numbers up. Treat 8.61 / 11.98 as the lowest value the gap can be, and re-measure before quoting
-a gap percentage.
+**The oracle is a measured point now, not a floor.** Stage 5's 8.61 / 11.98 was taken while ik paid its
+default 32 context checkpoints and our fork ran `-ctxcp 0` — an unfair comparison, which is why it was
+labelled a floor. Stage 9/10 re-measured both engines with checkpointing off and caps gated at
+`3532800/3840000`: **ik 9.2564 decode / 11.8322 prefill**. The campaign closed at **80% of that decode
+figure** (7.48 / 9.26 warm in-app) and within **+9.75% on prefill** against our shipping default.
+**Do not quote 8.61 / 11.98 as current** — they are superseded history.
 
 ### Metric Mutability
 
@@ -86,32 +87,43 @@ a gap percentage.
   model swap on the phone is a stage→verify→atomic-rename procedure that needs a human-visible plan.
 - Device physically unavailable (host-only session) → do host-side PPL / static analysis only.
 
-## Current state (2026-10-16)
+## Current state (2026-10-21) — Build 14
+
+**Engine optimization is CLOSED.** See *Final Campaign Archive* below for the ratified record; this
+section is the one-paragraph orientation and the archive is authoritative for the campaign.
 
 **`varH` is the shipping model.** 192 `blk.*.hc_*_(up|down)` BF16 → Q8_0; shard 2 byte-identical to
 the source.
 
 | item | value |
 |---|---|
-| engine | fork of llama.cpp `1b70350`, tree `6488af5` (+ uncommitted `BONSAI_SHIELD`/`BONSAI_PROF`) |
-| varH shard 1 | `e7c694526e82f633eda7f37b5e35ed7075fd39140018c99d73e305818ded12e2`, 37,033,916,192 B |
-| varH shard 2 | `316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113`, 28,800,138,432 B |
-| source shard 1 | `69820c02...b199b720`, 37,623,740,192 B (unmodified; the swap is reversible) |
-| model inventory | 1,223 tensors shard 1 + `per_layer_token_embd` in shard 2; experts 32,400 MiB |
-| arm protocol (varH) | **5.2264 t/s** — Stages 3/4 absolutes are these |
-| long-lived server (varH) | **6.90 t/s** decode median, **8.40 t/s** prefill mean |
-| oracle (`ik_llama.cpp` @ `8313388a`) | **8.61 t/s** decode median, **11.98 t/s** prefill mean → +25% / +43% |
-| `varH` host PPL | 2.9036; delta vs baseline **+0.092%** (Stage 2B/3) vs **+0.290%** (Stage 5 corrected method) — see *Known discrepancies* |
+| shipped build | **Build 14** (`versionCode 14`, `0.3.2-warmup-chip`), release `alpha-2` on GitHub |
+| APK | `apk-out/MoeDroid-0.3.2-warmup-chip-14-arm64.apk`, 121,438,632 B, sha256 `cfbb6fc2a7f93aa2…` |
+| engine libs | `libllama.so` sha256 `a8c15f409cc25e88…` = `build-arm64-ship` byte-identical |
+| engine | fork of llama.cpp `1b70350`; patch artifact `patches/llama.cpp-moedroid.patch` (155,923 B) |
+| varH shard 1 | `e7c694526e82f633eda7f37b5e35deb…`, 37,033,916,192 B |
+| varH shard 2 | `316b46f3a2dbd68c900f43136ab9449f…`, 28,800,138,432 B |
+| **decode, benched** | **6.945 t/s** (mirrored 2-pass, `throttled=0/6`) |
+| **decode, warm in-app** | **7.48 t/s** (n=3 consecutive requests, single session — not a mirrored pass) |
+| prefill, benched | 8.68 t/s (12-warmup protocol); **10.72 t/s** on a cool device without the heat-soak |
+| cumulative | **+23.4% decode / +45.0% prefill**, composite of paired deltas — self-check: 5.61 × 1.234 = 6.93 predicted vs 6.945 measured |
+| oracle (`ik_llama.cpp` @ `8313388a`) | 9.2564 t/s decode / 11.8322 t/s prefill → fork at **80%** of decode; ik prefill **+9.75%** vs our shipping V1 |
+| fanless reality | ~5–6 t/s sustained; **28 requests** to first clock suppression (82.2 °C cpuss) vs ik's 20 |
+| cold start | first 1–3 requests after idle are **25–30% slower** (prompt 1571 ms → 364 ms as the working set rewarms) |
 
-**Stage 7 (2026-10-18, on device):** `BONSAI_MOE_X4_PREFILL` (4-row x 2-token `q2_0` prefill tile) is
-now a compile-time default, measured **+3.31% prefill mean** (+3.66% / +2.95% in the two mirrored
-passes, its own replication spread 0.39%) and token-identical on a real 262-token prefill. Two
-candidates were rejected by measurement: `BONSAI_MOE_X4=3` (zero-spill decode kernel, **-3.62% mean
-over four pairs** - the spills it removed were cheaper than the activation loads it added) and
-`BONSAI_Q8_0_X4=1` (aligned activation repack, +0.05% decode, negative prefill). The `ik_llama.cpp`
-oracle gap was re-measured with `--poll` removed from every ik arm and 12 timed warmups on both
-engines: **+49.8% decode / +20.75% prefill**, both passes - i.e. larger than Stage 6's +38%/+24%, so
-8.61 / 11.98 are even further from reach than recorded. Details: `docs/STAGE7-report.md`.
+**Shipped engine changes** (each with a paired measurement; all 100% bit-exact):
+`varH` re-quantisation · `--cpu-mask-batch 0xff --cpu-strict-batch 1` (+21.5% prefill) ·
+`BONSAI_MOE_X4=1` four-row q2_0 decode kernel (+4.53%) · `BONSAI_MULMATID_FLAT=2` all-token expert
+queue (+15.53% prefill) · `BONSAI_MOE_X4_PREFILL=1` two-token prefill tile (+3.31%) ·
+**`BONSAI_HYBRID_VIEW=1`** zero-copy recurrent-state reads, −73 `GET_ROWS` and −73 `CPY` nodes/token
+(**+5.5% decode**).
+
+**NOT shipped — `ik_llama.cpp` adoption is closed.** It cleared quality (+0.026%, t=+0.11) and decode
+endurance (+36.23%), but its prefill gain is **+9.75% against our shipping default**, below the
+`+12.0%` bar the harness pre-declared in `driver.log:27`, and it suppresses 8 requests earlier
+fanless. Archived as fan-required / fanless-limited. Reopenable only via the three named triggers in
+the archive, including the explicit `(c)` kernel-port purchase.
+
 
 Shipping flags in `EngineProfile.kt` (QUALITY/BALANCED/SPEED; `THERMAL_SAVER` opts out of batch pinning):
 
@@ -121,9 +133,40 @@ Shipping flags in `EngineProfile.kt` (QUALITY/BALANCED/SPEED; `THERMAL_SAVER` op
 ```
 
 `ik_llama.cpp` loads our `varH` **unmodified** — same arch `qwen4exp`, same `GGML_TYPE_Q2_0 = 42`,
-`QK2_0 = 64`, byte-identical 18-byte `block_q2_0` (`{ggml_half d; uint8_t qs[16];}`) — and does not
-implement `--cpu-strict`/`--cpu-mask-batch`/`--poll`, so it cannot even take our +21.5% prefill
-pinning. It wins anyway (Stage 5 §1).
+`QK2_0 = 64`, byte-identical 18-byte `block_q2_0` (`{ggml_half d; uint8_t qs[16];}`). Upstream ik does
+not implement `--cpu-strict`/`--cpu-mask-batch`/`--poll`; our checkout adds `--cpu-mask-batch` through
+`patches/ik_llama.cpp-moedroid.patch` (34,271 B, base `8313388a`), and the pinning measured **neutral**
+for ik (B1−B0 = −0.85% to +0.06%). At matched clocks it is faster than our fork — **+34% decode at
+profile, +43% once both are throttled** — but it fails the adoption bar on prefill and suppresses 8
+requests earlier fanless. Closed; see the archive for the three re-open triggers.
+
+---
+
+## Open items (2026-10-21)
+
+The engine campaign is closed. These are the things that are genuinely still open, so a fresh session
+does not have to rediscover them:
+
+1. **Quality, not speed, is now the binding constraint.** varH's experts are ~2 bits per weight.
+   Fluency and general reasoning hold up; **precise factual recall degrades first** — that is the
+   quantisation, not the engine, and no experiment has ever been run on this axis. The open question
+   is whether a higher-quality quant is worth breaking the 24 GB page-cache model for (q4 roughly
+   doubles the pool, 66 → ~130 GB). **Measure before choosing**: run the same ~20 factual questions
+   through varH and a q4 build and count correct answers.
+2. **One line still standing in the frozen handoffs:** §4.4 of all three stamped handoffs still reads
+   *"revisit MTP only if the sidecar shrinks"*. The banner points to this file, so it is low-risk, but
+   it is a live instruction inside a historical document — the exact shape that misled two reviewers.
+   Replace it with a `CLOSED — see Negatives Table` pointer.
+3. **One untested flag delta, recorded as never run:** the app passes `--cache-ram 24576`
+   (`LlamaServerEngine.kt:432`) and the harness passes `-ub`; nothing else differs. Neither was ever
+   isolated. Because the warm app beats the bench (7.48 vs 7.105) the pair's *net* effect is bounded
+   at neutral-or-positive in-app — that is a bound, not a per-flag result.
+4. **Option `(c)` — the ik `q2_0` kernel port — remains available** at roughly +30% decode, and is
+   the only item above the noise floor that is not a port-with-costs. Gated on the owner's explicit
+   purchase, with its two strikes stated up front (bit-exactness forfeited; thermal convergence to
+   90 °C with suppression at request 21).
+5. **Sustained/fanless use is characterised, not fixed:** ~5–6 t/s and 28 requests to the clamp.
+   The answer is physical (a fan), not a code change.
 
 ---
 
@@ -135,8 +178,8 @@ decode by ~25-30%; relative results are valid within a stage.** Same class of er
 
 | Protocol | What it is | Where used | Value on varH |
 |---|---|---|---|
-| **arm** | fresh model load, one warmup request, one measured request (`s3_arm.sh`) | Stages 1-5 A/B blocks | **5.2264 t/s** |
-| **long-lived server** | one load, many repeated requests, median of steady samples | Stage 5 oracle run | **6.90 t/s** |
+| **arm** | fresh model load, one warmup request, one measured request (`s3_arm.sh`) | Stages 1-5 A/B blocks (historical) | **5.2264 t/s** (Stage 1 era) |
+| **long-lived server** | one load, many repeated requests, median of steady samples | every current measurement | **6.945 t/s** benched / **7.48 t/s** warm in-app (Build 14); oracle **9.2564** |
 | host-ppl | host `llama-perplexity`, 32 chunks, paired per chunk | quality gates | PPL delta |
 | host-static | host GGUF inventory / tensor parsing | model analysis | bytes, counts |
 
@@ -146,7 +189,9 @@ single warmup. Consequences:
 - Stage 3/4 absolute figures (5.61 t/s for `varH`) are **arm-protocol** numbers; their *relative*
   results stand, because both arms shared the protocol.
 - Stage 5 `varD` deltas (+1.95% / -3.87%) are arm-protocol numbers too — valid internally, not
-  comparable to 6.90/8.61.
+  comparable to the long-lived figures (6.945 ours / 9.2564 ik).
+- **Cold cache understates this workload by ~27%** (measured Stage 11: 5.43 → 7.48 t/s across three
+  requests; prompt processing 1571 → 364 ms). The 12 warmups are not ceremony.
 - Never compare a cross-stage or cross-engine number without fixing the protocol first.
 
 ### Thermal / cap regime (also first-class)
