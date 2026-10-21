@@ -26,7 +26,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
                                 "upstream-llama", "gguf-py"))
 from gguf import GGUFReader, GGUFWriter, GGMLQuantizationType as T  # noqa: E402
-from gguf.quants import dequantize, quantize                        # noqa: E402
+from gguf.quants import dequantize, quantize, quant_shape_to_byte_shape  # noqa: E402
 from gguf.constants import GGML_QUANT_SIZES                          # noqa: E402
 
 
@@ -117,7 +117,12 @@ def main():
             val = field.contents()
         except Exception:
             continue
-        writer.add_key_value(key, val, field.types[0] if field.types else None)
+        # Array fields carry types = [ARRAY, <element type>]; passing types[0]
+        # handed gguf-py ARRAY as the sub-type, so it defaulted integer arrays to
+        # int32 and died on overflow. The element type is types[-1].
+        val_type = field.types[0] if field.types else None
+        sub_type = field.types[-1] if (field.types and field.types[0].name == "ARRAY") else None
+        writer.add_key_value(key, val, val_type, sub_type=sub_type)
 
     n_changed = 0
     cos_min = 1.0
@@ -147,10 +152,14 @@ def main():
                 sys.exit(f"FATAL {t.name}: row cosine {lo:.4f} < 0.999 - wrong layout?")
             cos_min = min(cos_min, lo)
             del f32, back, a, b
-            writer.add_tensor(t.name, q, raw_shape=raw_shape, raw_dtype=dst_type)
+            writer.add_tensor(t.name, q, raw_shape=q.shape, raw_dtype=dst_type)
             n_changed += 1
         else:
-            writer.add_tensor(t.name, t.data, raw_shape=raw_shape, raw_dtype=t.tensor_type)
+            # raw_dtype means raw_shape must be the BYTE shape, and the reader's
+            # .data is already byte-shaped (in numpy order), so take it from there
+            # rather than deriving it from the logical dims - guessing the shape
+            # convention cost two failed starts.
+            writer.add_tensor(t.name, t.data, raw_shape=t.data.shape, raw_dtype=t.tensor_type)
         if (idx + 1) % 200 == 0:
             print(f"  {idx+1}/{len(reader.tensors)} tensors, {n_changed} requantised")
 

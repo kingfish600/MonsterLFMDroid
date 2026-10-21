@@ -1,0 +1,723 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index c8c0fa9..4bb5602 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -43,6 +43,10 @@
+ #include <sys/sysctl.h>
+ #endif
+ 
++#if !defined(_WIN32)
++#include <dlfcn.h>
++#endif
++
+ #if defined(_WIN32)
+ #define WIN32_LEAN_AND_MEAN
+ #ifndef NOMINMAX
+@@ -1033,6 +1037,74 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
+     // resolve the CPU affinity once, so the list stays alive until the context is created
+     params.cpu_affinity = cpu_affinity_resolve(params.cpu_affinity, params.cpu_affinity_auto);
+ 
++    // The batch pool must inherit the token pool unless it was given its own mask. This is
++    // unconditional: it must NOT be gated on n_threads/n_threads_batch, otherwise passing
++    // -tb <n> would silently leave the batch pool with an empty mask and no affinity at all
++    // (that is exactly the bug the mainline postprocess_cpu_params() n_threads < 0 copy hit).
++    if (!params.cpu_affinity_batch_configured) {
++        params.cpu_affinity_batch = params.cpu_affinity;
++    }
++    params.cpu_affinity_batch = cpu_affinity_resolve(params.cpu_affinity_batch, false);
++
++    if (!params.cpu_strict_batch_set) {
++        params.cpu_strict_batch = params.cpu_strict;
++    }
++
++    // --- --poll -------------------------------------------------------------------------
++    // ik computes with an OpenMP (libomp) thread pool and has no spin loop of its own, so the
++    // only honest way to honour --poll is to drive libomp's block time. libomp reads
++    // KMP_BLOCKTIME when its runtime initializes; we also push the value through
++    // kmp_set_blocktime() when libomp exports it, so it takes effect either way. A single
++    // libomp runtime is shared by both pools, so --poll and --poll-batch cannot differ.
++    int poll = params.cpu_poll;
++    if (poll < 0) {
++        poll = params.cpu_poll_batch;
++    }
++    if (params.cpu_poll >= 0 && params.cpu_poll_batch >= 0 && params.cpu_poll != params.cpu_poll_batch) {
++        fprintf(stderr, "warning: --poll %d and --poll-batch %d differ, but ik uses one OpenMP runtime; "
++                        "using --poll %d for both pools\n", params.cpu_poll, params.cpu_poll_batch, params.cpu_poll);
++    }
++    if (poll >= 0) {
++        if (poll > 100) {
++            poll = 100;
++        }
++
++        // mainline poll: 0 = never spin, 100 = spin forever; libomp block time is in ms
++        const int blocktime = poll <= 0 ? 0 : (poll >= 100 ? -1 : poll * 2);
++
++#if defined(_WIN32)
++        _putenv_s("KMP_BLOCKTIME", std::to_string(blocktime).c_str());
++#else
++        setenv("KMP_BLOCKTIME", std::to_string(blocktime).c_str(), 1);
++#endif
++        // libgomp (a non-libomp OpenMP runtime) only understands OMP_WAIT_POLICY; for the
++        // two extremes it agrees with the block time above, so setting it is never in conflict
++        if (poll <= 0 || poll >= 100) {
++            const char * wait_policy = poll <= 0 ? "PASSIVE" : "ACTIVE";
++#if defined(_WIN32)
++            _putenv_s("OMP_WAIT_POLICY", wait_policy);
++#else
++            setenv("OMP_WAIT_POLICY", wait_policy, 1);
++#endif
++        }
++        bool runtime_call = false;
++#if !defined(_WIN32)
++        if (void * sym = dlsym(RTLD_DEFAULT, "kmp_set_blocktime")) {
++            if (blocktime >= 0) {
++                typedef int (* kmp_set_blocktime_fn)(int);
++                kmp_set_blocktime_fn fn = nullptr;
++                static_assert(sizeof(fn) == sizeof(sym), "unexpected function pointer size");
++                memcpy(&fn, &sym, sizeof(fn));
++                fn(blocktime);
++                runtime_call = true;
++            }
++        }
++#endif
++        fprintf(stderr, "info: --poll %d -> libomp KMP_BLOCKTIME=%d%s (ik computes with OpenMP; "
++                        "there is no ik-owned spin loop to configure)\n",
++                poll, blocktime, runtime_call ? " + kmp_set_blocktime()" : "");
++    }
++
+     return true;
+ }
+ 
+@@ -2445,6 +2517,47 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
+         params.cpu_affinity_configured = true;
+         return true;
+     }
++    if (arg == "--cpu-strict") {
++        CHECK_ARG;
++        params.cpu_strict = std::atoi(argv[i]) != 0;
++        return true;
++    }
++    if (arg == "--cpu-mask-batch" || arg == "-cmb") {
++        CHECK_ARG;
++        if (!cpu_affinity_parse_mask(argv[i], params.cpu_affinity_batch)) {
++            fprintf(stderr, "error: invalid CPU mask '%s' for %s\n", argv[i], arg.c_str());
++            invalid_param = true;
++            return true;
++        }
++        params.cpu_affinity_batch_configured = true;
++        return true;
++    }
++    if (arg == "--cpu-range-batch" || arg == "-crb") {
++        CHECK_ARG;
++        if (!cpu_affinity_parse_range(argv[i], params.cpu_affinity_batch)) {
++            fprintf(stderr, "error: invalid CPU range '%s' for %s\n", argv[i], arg.c_str());
++            invalid_param = true;
++            return true;
++        }
++        params.cpu_affinity_batch_configured = true;
++        return true;
++    }
++    if (arg == "--cpu-strict-batch") {
++        CHECK_ARG;
++        params.cpu_strict_batch     = std::atoi(argv[i]) != 0;
++        params.cpu_strict_batch_set = true;
++        return true;
++    }
++    if (arg == "--poll") {
++        CHECK_ARG;
++        params.cpu_poll = std::atoi(argv[i]);
++        return true;
++    }
++    if (arg == "--poll-batch") {
++        CHECK_ARG;
++        params.cpu_poll_batch = std::atoi(argv[i]);
++        return true;
++    }
+     if (arg == "-prexp" || arg == "--prefetch-experts") {
+         params.prefetch_experts = true;
+         return true;
+@@ -3593,6 +3706,12 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
+     options.push_back({ "*",           "       --cpu-affinity",          "pin CPU workers to the physical P-cores (hybrid CPUs only)"});
+     options.push_back({ "*",           "-cm,   --cpu-mask MASK",         "pin CPU workers to the logical CPUs set in MASK (hex or decimal bitmask, e.g. 0x55; 64 CPUs max, use --cpu-range for more)"});
+     options.push_back({ "*",           "-cr,   --cpu-range LIST",        "pin CPU workers to the given logical CPUs (e.g. 0-3,8,10-11)"});
++    options.push_back({ "*",           "       --cpu-strict <0|1>",      "one CPU per worker (default: %d); 0 lets every worker float inside the mask", params.cpu_strict ? 1 : 0});
++    options.push_back({ "*",           "-cmb,  --cpu-mask-batch MASK",   "like --cpu-mask, for the batch/prompt pool (default: same as --cpu-mask)"});
++    options.push_back({ "*",           "-crb,  --cpu-range-batch LIST",  "like --cpu-range, for the batch/prompt pool (default: same as --cpu-range)"});
++    options.push_back({ "*",           "       --cpu-strict-batch <0|1>","like --cpu-strict, for the batch/prompt pool (default: same as --cpu-strict)"});
++    options.push_back({ "*",           "       --poll N",                "spin/wait level 0..100 for worker threads, applied through the OpenMP runtime (0 - no spinning, 100 - spin forever; default: libomp default)"});
++    options.push_back({ "*",           "       --poll-batch N",          "same as --poll (ik shares one OpenMP runtime, so both pools cannot differ)"});
+     options.push_back({ "*",           "       --fit-margin N",         "safety margin in MiB when auto-fitting model offloading"});
+     options.push_back({ "*",           "-gfm,  --gpu-fit-margin N",     "per-layer GPU fit margin as layer_id,margin pairs, comma-separated" });
+     options.push_back({ "*",           "-wgt, --worst-graph-tokens N",  "number of tokens to use for worst-case graph"});
+@@ -4697,6 +4816,12 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
+     cparams.n_threads_batch   = params.n_threads_batch == -1 ? params.n_threads : params.n_threads_batch;
+     cparams.cpu_affinity      = params.cpu_affinity.empty() ? nullptr : params.cpu_affinity.data();
+     cparams.n_cpu_affinity    = (int32_t) params.cpu_affinity.size();
++    // the batch pool is filled by gpt_params_parse() already (it follows the token pool unless
++    // --cpu-mask-batch/--cpu-range-batch was given), so it never depends on -tb being passed
++    cparams.cpu_affinity_batch     = params.cpu_affinity_batch.empty() ? nullptr : params.cpu_affinity_batch.data();
++    cparams.n_cpu_affinity_batch   = (int32_t) params.cpu_affinity_batch.size();
++    cparams.cpu_affinity_strict       = params.cpu_strict;
++    cparams.cpu_affinity_strict_batch = params.cpu_strict_batch;
+     cparams.seed              = params.seed;
+     cparams.logits_all        = params.logits_all;
+     cparams.embeddings        = params.embedding;
+diff --git a/common/common.h b/common/common.h
+index 78175f6..60ab86a 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -314,6 +314,13 @@ struct gpt_params {
+     std::vector<int32_t> cpu_affinity;       // logical CPU ids to pin worker threads to (empty = no explicit pinning)
+     bool    cpu_affinity_auto     = false;   // pin to hybrid P-cores when cpu_affinity is empty (--cpu-affinity)
+     bool    cpu_affinity_configured = false; // a CPU affinity option was given
++    std::vector<int32_t> cpu_affinity_batch; // logical CPU ids to pin the batch/prompt pool to (empty = follow cpu_affinity)
++    bool    cpu_affinity_batch_configured = false; // a batch CPU affinity option was given
++    bool    cpu_strict            = true;    // true: one CPU per worker (ik default); false: every worker floats in the mask
++    bool    cpu_strict_batch      = true;    // same for the batch pool
++    bool    cpu_strict_batch_set  = false;   // --cpu-strict-batch was given explicitly
++    int32_t cpu_poll              = -1;      // spin/poll level 0..100 for the token pool (-1 = not given)
++    int32_t cpu_poll_batch        = -1;      // spin/poll level 0..100 for the batch pool (-1 = follow cpu_poll)
+     int32_t n_predict             =      -1; // new tokens to predict
+     int32_t n_ctx                 =       0; // context size
+     int32_t n_batch               =    2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index b3a44f0..9a65073 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -105,6 +105,7 @@ extern "C" {
+     GGML_API           void ggml_backend_cpu_set_n_threads     (ggml_backend_t backend_cpu, int n_threads);
+     GGML_API           void ggml_backend_cpu_set_moe_expert_prefetch(ggml_backend_t backend_cpu, bool enable);
+     GGML_API           void ggml_backend_cpu_set_cpu_affinity  (ggml_backend_t backend_cpu, const int32_t * cpus, int n_cpus);
++    GGML_API           void ggml_backend_cpu_set_cpu_affinity_strict(ggml_backend_t backend_cpu, bool strict);
+     GGML_API           void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data);
+ 
+     // Create a backend buffer from an existing pointer
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index fc9880a..f1aef65 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -863,6 +863,9 @@ extern "C" {
+         // optional CPU affinity: pin worker ith to cpu_affinity[ith % n_cpu_affinity]
+         const int32_t * cpu_affinity;
+         int32_t         n_cpu_affinity;
++        // strict affinity: true  -> worker ith is pinned to the single CPU cpu_affinity[ith % n_cpu_affinity]
++        //                  false -> every worker is pinned to the whole cpu_affinity set and floats inside it
++        bool            cpu_affinity_strict;
+     };
+ 
+     enum ggml_cgraph_eval_order {
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index d2a7445..086f71c 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -810,6 +810,7 @@ struct ggml_backend_cpu_context {
+     // optional per-thread CPU affinity
+     int32_t cpu_affinity[GGML_MAX_CPU_AFFINITY];
+     int32_t n_cpu_affinity;
++    bool    cpu_affinity_strict;
+ };
+ 
+ GGML_CALL static const char * ggml_backend_cpu_name(ggml_backend_t backend) {
+@@ -857,6 +858,7 @@ GGML_CALL static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(gg
+     cpu_plan->cplan.moe_expert_prefetch = cpu_ctx->moe_expert_prefetch;
+     cpu_plan->cplan.cpu_affinity        = cpu_ctx->cpu_affinity;
+     cpu_plan->cplan.n_cpu_affinity      = cpu_ctx->n_cpu_affinity;
++    cpu_plan->cplan.cpu_affinity_strict = cpu_ctx->cpu_affinity_strict;
+ 
+     return cpu_plan;
+ }
+@@ -899,6 +901,7 @@ GGML_CALL static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t
+     cplan.moe_expert_prefetch = cpu_ctx->moe_expert_prefetch;
+     cplan.cpu_affinity        = cpu_ctx->cpu_affinity;
+     cplan.n_cpu_affinity      = cpu_ctx->n_cpu_affinity;
++    cplan.cpu_affinity_strict = cpu_ctx->cpu_affinity_strict;
+ 
+     return ggml_graph_compute(cgraph, &cplan);
+ }
+@@ -979,6 +982,7 @@ ggml_backend_t ggml_backend_cpu_init(void) {
+     ctx->abort_callback_data = NULL;
+     ctx->moe_expert_prefetch = false;
+     ctx->n_cpu_affinity      = 0;
++    ctx->cpu_affinity_strict = true; // ik default: one CPU per worker
+ 
+     ggml_backend_t cpu_backend = (ggml_backend_t)malloc(sizeof(struct ggml_backend));
+     if (cpu_backend == NULL) {
+@@ -1026,6 +1030,13 @@ void ggml_backend_cpu_set_cpu_affinity(ggml_backend_t backend_cpu, const int32_t
+     }
+ }
+ 
++void ggml_backend_cpu_set_cpu_affinity_strict(ggml_backend_t backend_cpu, bool strict) {
++    GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
++
++    struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
++    ctx->cpu_affinity_strict = strict;
++}
++
+ void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data) {
+     GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
+ 
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index c5fd7ec..c4d9204 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -29041,14 +29041,28 @@ static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_
+         }
+     }
+ 
+-    const int cpu = cplan->cpu_affinity[thread_n % cplan->n_cpu_affinity];
+-    if (cpu < 0 || cpu >= CPU_SETSIZE) {
+-        return;
+-    }
+-
+     cpu_set_t mask;
+     CPU_ZERO(&mask);
+-    CPU_SET(cpu, &mask);
++
++    if (cplan->cpu_affinity_strict) {
++        // strict: worker `thread_n` gets exactly one CPU, round-robin over the list
++        const int cpu = cplan->cpu_affinity[thread_n % cplan->n_cpu_affinity];
++        if (cpu < 0 || cpu >= CPU_SETSIZE) {
++            return;
++        }
++        CPU_SET(cpu, &mask);
++    } else {
++        // non-strict: every worker may float inside the whole affinity list
++        for (int i = 0; i < cplan->n_cpu_affinity; ++i) {
++            const int cpu = cplan->cpu_affinity[i];
++            if (cpu >= 0 && cpu < CPU_SETSIZE) {
++                CPU_SET(cpu, &mask);
++            }
++        }
++        if (CPU_COUNT(&mask) == 0) {
++            return;
++        }
++    }
+ 
+     const int rv = pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask);
+     if (rv) {
+@@ -29554,6 +29568,123 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
+     return cplan;
+ }
+ 
++// --- diag: per-op WALL-CLOCK timing (BONSAI_PROF), format-compatible with our fork ---
++//
++// Thread 0 alone takes the timestamps: t0 immediately before ggml_compute_forward and dt
++// immediately after the ggml_barrier() that ends the node. Because every worker must reach that
++// barrier, dt is the node's true wall-clock time on the whole threadpool, not one worker's share
++// of it. The previous version timed every worker and summed the rows, which reported ~537 ms per
++// graph (6x the wall time) and perturbed the measurement with 6x clock_gettime per node; that is
++// why Stage 7 could not compare ik's milliseconds against our fork's.
++//
++// The output block is byte-compatible with the fork's (ggml/src/ggml-cpu/ggml-cpu.c, g_prof_dump),
++// so MoeDroid/tools/s4_prof.py parses both engines without special-casing. Two extra
++// BONSAI_PROF* diagnostic lines are emitted that the parser ignores:
++//   BONSAI_PROF WALL  - thread 0's total time across the node loop, so the sum of the op rows can
++//                       be checked against the graph's real wall time (see s8_prof_verify.c)
++//   BONSAI_PROF WORK  - only when BONSAI_PROF_WORKERS=1: the old per-worker sum, kept as a
++//                       diagnostic for how far CPU-time shares drift from wall time
++#ifndef BONSAI_PROF
++#define BONSAI_PROF 0
++#endif
++#if BONSAI_PROF
++#define BONSAI_PROF_MAX_THREADS 64
++
++// thread 0's wall-clock rows: the only ones used for the report
++static uint64_t g_bp_ns         [GGML_OP_COUNT];
++static uint64_t g_bp_calls      [GGML_OP_COUNT];
++static uint64_t g_bp_type_ns    [GGML_TYPE_COUNT];
++static uint64_t g_bp_type_calls [GGML_TYPE_COUNT];
++static uint64_t g_bp_wall_ns;               // thread 0: total node-loop wall time
++// optional per-worker CPU-time rows (diagnostic only)
++static uint64_t g_bp_worker_ns   [BONSAI_PROF_MAX_THREADS][GGML_OP_COUNT];
++static uint64_t g_bp_worker_calls[BONSAI_PROF_MAX_THREADS][GGML_OP_COUNT];
++static uint64_t g_bp_graphs;
++static int      g_bp_enabled = -1;
++static long     g_bp_every   = 1;
++static int      g_bp_workers = -1;
++
++static inline int bonsai_bp_on(void) {
++    if (g_bp_enabled < 0) {
++        const char * e = getenv("BONSAI_PROF");
++        const char * v = getenv("BONSAI_PROF_EVERY");
++        const char * w = getenv("BONSAI_PROF_WORKERS");
++        // Enable on BONSAI_PROF *or* BONSAI_PROF_EVERY, matching our fork (ggml-cpu.c only reads
++        // BONSAI_PROF_EVERY). Requiring BONSAI_PROF here made every Stage 8 profiler arm that set
++        // only BONSAI_PROF_EVERY dump nothing at all, which the clock gate then reported as an
++        // unmeasurable pair - correct behaviour, wrong cause.
++        g_bp_enabled = (e && atoi(e) > 0) ? 1 : ((v && atol(v) > 0) ? 1 : 0);
++        g_bp_every   = v ? atol(v) : 1;
++        g_bp_workers = w ? atoi(w) : 0;
++        if (g_bp_every < 1) g_bp_every = 1;
++    }
++    return g_bp_enabled;
++}
++static inline int bonsai_bp_workers(void) { (void) bonsai_bp_on(); return g_bp_workers; }
++
++static inline uint64_t bonsai_bp_now(void) {
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
++}
++
++static void bonsai_bp_faults(uint64_t * minf, uint64_t * majf) {
++    *minf = 0;
++    *majf = 0;
++    FILE * f = fopen("/proc/self/stat", "r");
++    if (!f) return;
++    char buf[4096];
++    const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
++    fclose(f);
++    buf[n] = 0;
++    const char * p = strrchr(buf, ')');
++    if (!p) return;
++    p++;
++    unsigned long long a1,a2,a3,a4,a5,a6,mn,cm,mj;
++    if (sscanf(p, " %*c %llu %llu %llu %llu %llu %llu %llu %llu %llu",
++               &a1,&a2,&a3,&a4,&a5,&a6,&mn,&cm,&mj) == 9) {
++        *minf = mn;
++        *majf = mj;
++    }
++}
++
++static void bonsai_bp_dump(void) {
++    uint64_t mn, mj;
++    bonsai_bp_faults(&mn, &mj);
++    fprintf(stderr, "\n=== CPU OP PROFILE after %llu graphs minflt=%llu majflt=%llu ===\n",
++        (unsigned long long) g_bp_graphs, (unsigned long long) mn, (unsigned long long) mj);
++    for (int op = 0; op < GGML_OP_COUNT; ++op) {
++        if (!g_bp_calls[op]) continue;
++        fprintf(stderr, "  %-22s %9.2f ms total %8.3f ms/graph %9llu calls\n",
++            ggml_op_name((enum ggml_op) op),
++            g_bp_ns[op] / 1e6, g_bp_ns[op] / 1e6 / (double) g_bp_graphs,
++            (unsigned long long) g_bp_calls[op]);
++    }
++    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
++        if (!g_bp_type_ns[t]) continue;
++        fprintf(stderr, "  MATMUL %-14s %9.2f ms total %8.3f ms/graph\n",
++            ggml_type_name((enum ggml_type) t),
++            g_bp_type_ns[t] / 1e6, g_bp_type_ns[t] / 1e6 / (double) g_bp_graphs);
++    }
++
++    uint64_t sum_op = 0;
++    for (int op = 0; op < GGML_OP_COUNT; ++op) sum_op += g_bp_ns[op];
++    uint64_t sum_ty = 0;
++    for (int t = 0; t < GGML_TYPE_COUNT; ++t) sum_ty += g_bp_type_ns[t];
++    fprintf(stderr, "BONSAI_PROF WALL graphs=%llu wall_ms=%.3f sum_op_ms=%.3f sum_type_ms=%.3f\n",
++        (unsigned long long) g_bp_graphs, g_bp_wall_ns / 1e6, sum_op / 1e6, sum_ty / 1e6);
++
++    if (bonsai_bp_workers()) {
++        uint64_t wsum = 0;
++        for (int t = 0; t < BONSAI_PROF_MAX_THREADS; ++t)
++            for (int op = 0; op < GGML_OP_COUNT; ++op) wsum += g_bp_worker_ns[t][op];
++        fprintf(stderr, "BONSAI_PROF WORK worker_sum_ms=%.3f (CPU-time shares, NOT wall clock)\n",
++            wsum / 1e6);
++    }
++    fflush(stderr);
++}
++#endif // BONSAI_PROF
++
+ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+ 
+@@ -29576,6 +29707,15 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     int64_t t_eval  = 0;
+ #endif
+ 
++#if BONSAI_PROF
++    // read the gate once per graph, not once per node, and start thread 0's wall clock here so
++    // the node-loop time can be compared against the sum of the op rows
++    const int bp_on = bonsai_bp_on();
++    const int bp_work = bp_on && bonsai_bp_workers();
++    const int bp_me = (state->ith == 0);
++    uint64_t bp_loop0 = 0;
++    if (bp_on && bp_me) bp_loop0 = bonsai_bp_now();
++#endif
+     for (int node_n = 0; node_n < cgraph->n_nodes; node_n++) {
+         struct ggml_tensor * node = cgraph->nodes[node_n];
+ 
+@@ -29583,8 +29723,25 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+ 
+ #if IK_PRINT_TIMING
+         int64_t tim1 = ggml_time_us();
++#endif
++#if BONSAI_PROF
++        // only thread 0 times the node, and only it writes the wall-clock rows
++        const int bp_t = state->ith < BONSAI_PROF_MAX_THREADS ? state->ith : BONSAI_PROF_MAX_THREADS - 1;
++        uint64_t bp_t0 = 0, bp_w0 = 0;
++        if (bp_on && bp_me) bp_t0 = bonsai_bp_now();
++        if (bp_work) bp_w0 = bonsai_bp_now();
+ #endif
+         node_n = ggml_compute_forward(&params, node, cgraph, node_n);
++#if BONSAI_PROF
++        if (bp_work) {
++            const uint64_t bp_wdt = bonsai_bp_now() - bp_w0;
++            const int bp_op = (int) node->op;
++            if (bp_op >= 0 && bp_op < GGML_OP_COUNT) {
++                g_bp_worker_ns[bp_t][bp_op] += bp_wdt;
++                g_bp_worker_calls[bp_t][bp_op]++;
++            }
++        }
++#endif
+ #if IK_PRINT_TIMING
+         int64_t tim2 = ggml_time_us();
+         t_eval += tim2 - tim1;
+@@ -29595,11 +29752,39 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+         }
+ 
+         ggml_barrier(state->shared);
++#if BONSAI_PROF
++        // every worker has finished this node, so dt is the node's wall time on the whole pool
++        if (bp_on && bp_me) {
++            const uint64_t bp_dt = bonsai_bp_now() - bp_t0;
++            const int bp_op = (int) node->op;
++            if (bp_op >= 0 && bp_op < GGML_OP_COUNT) {
++                g_bp_ns[bp_op] += bp_dt;
++                g_bp_calls[bp_op]++;
++            }
++            if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID ||
++                 node->op == GGML_OP_MOE_FUSED_UP_GATE) && node->src[0]) {
++                const int bp_ty = (int) node->src[0]->type;
++                if (bp_ty >= 0 && bp_ty < GGML_TYPE_COUNT) {
++                    g_bp_type_ns[bp_ty] += bp_dt;
++                    g_bp_type_calls[bp_ty]++;
++                }
++            }
++        }
++#endif
+ 
+         if (state->shared->ec != GGML_STATUS_SUCCESS) {
+             break;
+         }
+     }
++#if BONSAI_PROF
++    // safe to dump here: the last iteration's ggml_barrier() ordered every worker's writes
++    if (bp_on && bp_me) {
++        g_bp_wall_ns += bonsai_bp_now() - bp_loop0;
++        if ((++g_bp_graphs % (uint64_t) g_bp_every) == 0) {
++            bonsai_bp_dump();
++        }
++    }
++#endif
+ #if IK_PRINT_TIMING
+     int64_t t_end = ggml_time_us();
+     if (state->ith == 0) printf("ggml_barrier(...): %d us\n", (int)(t_end - t_start - t_eval));
+diff --git a/include/llama.h b/include/llama.h
+index 92cc4ed..edfbd0b 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -533,6 +533,13 @@ extern "C" {
+         // pinned to cpu_affinity[t % n_cpu_affinity], NULL = no pinning
+         const int32_t * cpu_affinity;
+         int32_t         n_cpu_affinity;
++        // same, for the batch/prompt-processing pool (n_tokens > 1); NULL = use cpu_affinity
++        const int32_t * cpu_affinity_batch;
++        int32_t         n_cpu_affinity_batch;
++        // strict placement: true pins each worker to a single CPU from the list, false lets
++        // every worker float inside the whole list (default: true, matching cpu-mask behaviour)
++        bool            cpu_affinity_strict;
++        bool            cpu_affinity_strict_batch;
+     };
+ 
+     // model quantization parameters
+@@ -1142,6 +1149,13 @@ extern "C" {
+     // cpus[t % n_cpus]. Configure before compute, n_cpus == 0 disables pinning.
+     LLAMA_API void llama_set_cpu_affinity(struct llama_context * ctx, const int32_t * cpus, int n_cpus);
+ 
++    // same as llama_set_cpu_affinity, for the batch/prompt-processing pool (n_tokens > 1);
++    // an empty list falls back to the token pool affinity
++    LLAMA_API void llama_set_cpu_affinity_batch(struct llama_context * ctx, const int32_t * cpus, int n_cpus);
++
++    // strict CPU placement per pool (see llama_context_params)
++    LLAMA_API void llama_set_cpu_affinity_strict(struct llama_context * ctx, bool strict, bool strict_batch);
++
+     // Get the number of threads used for generation of a single token.
+     LLAMA_API uint32_t llama_n_threads(struct llama_context * ctx);
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 30e62c9..4b2171a 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -361,6 +361,13 @@ struct llama_context {
+ 
+     std::vector<float> scale_data;
+ 
++    // CPU affinity, owned here: the token/decode pool and the batch/prompt pool.
++    // The batch list is empty when it should follow the token list.
++    std::vector<int32_t> cpu_affinity;
++    std::vector<int32_t> cpu_affinity_batch;
++    bool cpu_affinity_strict       = true;
++    bool cpu_affinity_strict_batch = true;
++
+     std::unordered_map<struct llama_lora_adapter *, float> lora_adapters;
+ 
+     std::vector<ggml_backend_t> backends;
+diff --git a/src/llama.cpp b/src/llama.cpp
+index aa6ba72..ea425c7 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -7224,10 +7224,24 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
+ }
+ 
+ 
++// push the affinity of the pool that owns this graph to the CPU backend:
++// the batch/prompt pool when the graph processes more than one token, else the token pool.
++// this is done per graph so that passing -tb cannot leave the batch pool unpinned.
++static void llama_graph_compute_set_affinity(llama_context & lctx, bool batch_pool) {
++    const std::vector<int32_t> & cpus_batch = lctx.cpu_affinity_batch.empty() ? lctx.cpu_affinity : lctx.cpu_affinity_batch;
++    const std::vector<int32_t> & cpus       = (batch_pool ? cpus_batch : lctx.cpu_affinity);
++
++    ggml_backend_cpu_set_cpu_affinity(lctx.backend_cpu,
++            cpus.empty() ? nullptr : cpus.data(), (int) cpus.size());
++    ggml_backend_cpu_set_cpu_affinity_strict(lctx.backend_cpu,
++            batch_pool ? lctx.cpu_affinity_strict_batch : lctx.cpu_affinity_strict);
++}
++
+ static void llama_graph_compute(
+         llama_context & lctx,
+           ggml_cgraph * gf,
+-                  int   n_threads) {
++                  int   n_threads,
++                 bool   batch_pool) {
+ #ifdef GGML_USE_METAL
+     if (ggml_backend_is_metal(lctx.backend_metal)) {
+         ggml_backend_metal_set_n_cb(lctx.backend_metal, n_threads);
+@@ -7238,6 +7252,7 @@ static void llama_graph_compute(
+         ggml_backend_cpu_set_n_threads(lctx.backend_cpu, n_threads);
+         ggml_backend_cpu_set_abort_callback(lctx.backend_cpu, lctx.abort_callback, lctx.abort_callback_data);
+         ggml_backend_cpu_set_moe_expert_prefetch(lctx.backend_cpu, lctx.cparams.prefetch_experts);
++        llama_graph_compute_set_affinity(lctx, batch_pool);
+     }
+ 
+     ggml_backend_sched_graph_compute_async(lctx.sched, gf);
+@@ -7249,7 +7264,8 @@ static void llama_graph_compute_sched(
+         llama_context & lctx,
+         ggml_backend_sched_t sched,
+           ggml_cgraph * gf,
+-                  int   n_threads) {
++                  int   n_threads,
++                 bool   batch_pool) {
+ #ifdef GGML_USE_METAL
+     if (ggml_backend_is_metal(lctx.backend_metal)) {
+         ggml_backend_metal_set_n_cb(lctx.backend_metal, n_threads);
+@@ -7260,6 +7276,7 @@ static void llama_graph_compute_sched(
+         ggml_backend_cpu_set_n_threads(lctx.backend_cpu, n_threads);
+         ggml_backend_cpu_set_abort_callback(lctx.backend_cpu, lctx.abort_callback, lctx.abort_callback_data);
+         ggml_backend_cpu_set_moe_expert_prefetch(lctx.backend_cpu, lctx.cparams.prefetch_experts);
++        llama_graph_compute_set_affinity(lctx, batch_pool);
+     }
+ 
+     ggml_backend_sched_graph_compute_async(sched, gf);
+@@ -7740,7 +7757,7 @@ static int llama_decode_internal(
+         tim1 = ggml_time_us();
+ #endif
+         //fprintf(stderr, "%s: invoking llama_graph_compute\n", __func__);
+-        llama_graph_compute(lctx, gf, n_threads);
++        llama_graph_compute(lctx, gf, n_threads, n_tokens != 1);
+ 
+         if (llm_arch_is_dsv4(lctx.model.arch) &&
+             llama_dsv4_per_step_capture_active(lctx) &&
+@@ -8138,7 +8155,7 @@ static int llama_encode_internal(
+ 
+     llama_set_inputs(lctx, batch);
+ 
+-    llama_graph_compute(lctx, gf, n_threads);
++    llama_graph_compute(lctx, gf, n_threads, n_tokens != 1);
+ 
+     // extract embeddings
+     if (embd) {
+@@ -8432,7 +8449,8 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
+ 
+     ggml_cgraph * gf = llm_build_context::llama_build_graph_defrag(lctx, ids);
+ 
+-    llama_graph_compute(lctx, gf, lctx.cparams.n_threads);
++    // maintenance graph, not a batch matmul: keep the token pool, as before
++    llama_graph_compute(lctx, gf, lctx.cparams.n_threads, false);
+ #endif
+ 
+     //const int64_t t_end = ggml_time_us();
+@@ -8471,7 +8489,8 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
+ 
+             llama_set_k_shift(lctx);
+ 
+-            llama_graph_compute(lctx, gf, lctx.cparams.n_threads);
++            // maintenance graph, not a batch matmul: keep the token pool, as before
++            llama_graph_compute(lctx, gf, lctx.cparams.n_threads, false);
+ 
+             need_reserve = true;
+         }
+@@ -8497,7 +8516,8 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
+ 
+             llama_set_s_copy(lctx);
+ 
+-            llama_graph_compute(lctx, gf, lctx.cparams.n_threads);
++            // maintenance graph, not a batch matmul: keep the token pool, as before
++            llama_graph_compute(lctx, gf, lctx.cparams.n_threads, false);
+ 
+             need_reserve = true;
+         }
+@@ -8901,6 +8921,10 @@ struct llama_context_params llama_context_default_params() {
+         /*.dflash_query_capacity       =*/ 0,
+         /*.cpu_affinity                =*/ nullptr,
+         /*.n_cpu_affinity              =*/ 0,
++        /*.cpu_affinity_batch          =*/ nullptr,
++        /*.n_cpu_affinity_batch        =*/ 0,
++        /*.cpu_affinity_strict         =*/ true,
++        /*.cpu_affinity_strict_batch   =*/ true,
+     };
+ 
+     return result;
+@@ -9797,6 +9821,14 @@ struct llama_context * llama_init_from_model(
+         if (params.cpu_affinity != NULL && params.n_cpu_affinity > 0) {
+             llama_set_cpu_affinity(ctx, params.cpu_affinity, params.n_cpu_affinity);
+         }
++        // the batch pool follows the token pool unless it was given its own mask; this is
++        // unconditional (it must not depend on n_threads_batch or on -tb being passed)
++        llama_set_cpu_affinity_batch(ctx,
++                (params.cpu_affinity_batch != NULL && params.n_cpu_affinity_batch > 0) ? params.cpu_affinity_batch : params.cpu_affinity,
++                (params.cpu_affinity_batch != NULL && params.n_cpu_affinity_batch > 0) ? params.n_cpu_affinity_batch   : params.n_cpu_affinity);
++        llama_set_cpu_affinity_strict(ctx,
++                params.cpu_affinity_strict,
++                (params.cpu_affinity_batch != NULL && params.n_cpu_affinity_batch > 0) ? params.cpu_affinity_strict_batch : params.cpu_affinity_strict);
+ 
+         if (!llama_kv_cache_init(ctx->kv_self, ctx, type_k, type_v, params.idx_type_k, kv_size, cparams.offload_kqv,
+                     params.type_k_first, params.type_k_last, params.type_v_first, params.type_v_last,
+@@ -13168,11 +13200,38 @@ void llama_set_n_threads(struct llama_context * ctx, uint32_t n_threads, uint32_
+ }
+ 
+ void llama_set_cpu_affinity(struct llama_context * ctx, const int32_t * cpus, int n_cpus) {
++    if (n_cpus < 0) {
++        n_cpus = 0;
++    }
++    if (n_cpus > 0 && cpus != nullptr) {
++        ctx->cpu_affinity.assign(cpus, cpus + n_cpus);
++    } else {
++        ctx->cpu_affinity.clear();
++    }
++
+     if (ctx->backend_cpu == nullptr) {
+         return;
+     }
+ 
+-    ggml_backend_cpu_set_cpu_affinity(ctx->backend_cpu, cpus, n_cpus);
++    ggml_backend_cpu_set_cpu_affinity(ctx->backend_cpu, ctx->cpu_affinity.empty() ? nullptr : ctx->cpu_affinity.data(), (int) ctx->cpu_affinity.size());
++}
++
++void llama_set_cpu_affinity_batch(struct llama_context * ctx, const int32_t * cpus, int n_cpus) {
++    if (n_cpus < 0) {
++        n_cpus = 0;
++    }
++    if (n_cpus > 0 && cpus != nullptr) {
++        ctx->cpu_affinity_batch.assign(cpus, cpus + n_cpus);
++    } else {
++        ctx->cpu_affinity_batch.clear();
++    }
++
++    // nothing to push here: the batch list is applied per graph in llama_graph_compute()
++}
++
++void llama_set_cpu_affinity_strict(struct llama_context * ctx, bool strict, bool strict_batch) {
++    ctx->cpu_affinity_strict       = strict;
++    ctx->cpu_affinity_strict_batch = strict_batch;
+ }
+ 
+ uint32_t llama_n_threads(struct llama_context * ctx) {

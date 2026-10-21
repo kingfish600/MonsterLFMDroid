@@ -442,6 +442,13 @@ class LlamaServerEngine(private val context: Context) : BonsaiEngine {
         // device actually has the 6-core perf cluster.
         if (p.pinPerfCluster && Runtime.getRuntime().availableProcessors() >= 6) {
             args += listOf("--cpu-mask", "0x3f", "--cpu-strict", "1")
+            // The batch pool does not inherit --cpu-mask when -tb is passed, so it needs
+            // its own mask or it runs unpinned across both clusters. Prompt processing is
+            // compute-bound, so it wants all eight cores rather than the perf cluster.
+            // See EngineProfile.pinBatchAllCores for the measurement.
+            if (p.pinBatchAllCores && p.threadsBatch > 0) {
+                args += listOf("--cpu-mask-batch", "0xff", "--cpu-strict-batch", "1")
+            }
         }
         if (p.pollPercent >= 0) args += listOf("--poll", p.pollPercent.toString())
         // --mlock was replaced upstream by --load-mode. Note mlock is wrong for

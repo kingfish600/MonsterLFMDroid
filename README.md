@@ -4,14 +4,16 @@ An Android app that runs a **~176B-parameter hybrid MoE** (Qwen3.8-Flash-Next: 5
 top-10 routed, ~6B active per token) **entirely on-device** — no server, no network, CPU only —
 straight from a 66 GB mixed-quant GGUF.
 
-**Status: 0.1.0-alpha.** It works and it is usable, but expect rough edges.
+**Status: 0.3.2 (Build 14, `versionCode 14`).** It works and it is usable, but expect rough edges.
+Engine optimization is closed; see `GOAL.md`, "Final Campaign Archive — Ratified Complete at Build 14".
 
 Measured on a RedMagic 10S Pro (Snapdragon 8 Elite, 24 GB RAM, 1 TB UFS):
 
 | | |
 |---|---:|
-| Decode | **4.4 t/s** at full quality |
-| Prefill | **~7.3-8.6 t/s** on a 966-token prompt |
+| Decode | **6.95 t/s** benched, same protocol as the **5.61** baseline (**+23.4%**) |
+| Decode (warm, in app) | **7.48 t/s** — warm in-app, **n=3 consecutive warm requests, single session; not a mirrored-pass measurement; cold request 1 read 5.43** |
+| Prefill | **8.4-8.6 t/s** on a 262-token prompt (**+45.0%** benched composite) |
 | Weights | 66.4 GB, 2 shards, demand-paged from UFS |
 | RAM to fit | 24 GB phone; ~15.5 GB page cache holds the hot expert working set |
 

@@ -112,6 +112,23 @@ data class EngineProfile(
      *  is what made small thread counts look optimal. Pinned, more workers buy
      *  memory-level parallelism instead. */
     val pinPerfCluster: Boolean = true,
+    /** llama-server --cpu-mask-batch/--cpu-strict-batch: pin the prompt-processing
+     *  pool to all eight cores, one worker per core.
+     *
+     *  Passing -tb does NOT make the batch pool inherit --cpu-mask. In
+     *  postprocess_cpu_params the whole cpu-params struct is copied into the batch
+     *  params only while the batch thread count is unset, so with -tb 8 the batch
+     *  pool keeps an all-zero cpumask and no affinity is ever applied - it floats
+     *  across both clusters. The CLI help's "default: same as --cpu-mask" holds only
+     *  when -tb is absent. Confirmed on device: 19 of 24 threads carried
+     *  Cpus_allowed_list 0-7 and the seven prefill workers ran on cpu6/7.
+     *
+     *  Measured on this phone on the varH dense rewrite, 256-token prompts, mirrored
+     *  A/B/B/A, every arm on one cap profile: 7.47 -> 9.07 t/s prefill (+21.5%, 4/4
+     *  pairs, t = 9.08). A single 256-token-prefill + 64-token-decode request measured
+     *  +17.9% prefill and +3.5% decode, so generation does not regress. Measured only
+     *  at -t 6 -tb 8; THERMAL_SAVER's -tb 4 is uncharacterised and opts out. */
+    val pinBatchAllCores: Boolean = true,
 ) {
     companion object {
         // Flash-Next is a 176B MoE: ~0.7 GB of expert weights are touched per
@@ -149,6 +166,7 @@ data class EngineProfile(
             contextTokens = 4_096,
             threads = 4,   // fewer workers = less heat, still inside one cluster
             threadsBatch = 4,
+            pinBatchAllCores = false, // -tb 4 was never measured with a batch mask
             reasoningEffort = "low",
             pollPercent = 0,
         )

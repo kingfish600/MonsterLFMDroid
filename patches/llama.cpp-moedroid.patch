@@ -23,6 +23,1031 @@ index 224bdef..b368963 100644
      GGML_API struct ggml_tensor * ggml_cumsum(
          struct ggml_context * ctx,
          struct ggml_tensor  * a);
+diff --git a/ggml/src/ggml-cpu/CMakeLists.txt b/ggml/src/ggml-cpu/CMakeLists.txt
+index d347757..3fdbe8e 100644
+--- a/ggml/src/ggml-cpu/CMakeLists.txt
++++ b/ggml/src/ggml-cpu/CMakeLists.txt
+@@ -103,6 +103,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
+         message(STATUS "ARM detected")
+         list(APPEND GGML_CPU_SOURCES
+             ggml-cpu/arch/arm/quants.c
++            ggml-cpu/arch/arm/iqk_x4.c
+             ggml-cpu/arch/arm/repack.cpp
+             )
+ 
+diff --git a/ggml/src/ggml-cpu/arch/arm/iqk_x4.c b/ggml/src/ggml-cpu/arch/arm/iqk_x4.c
+new file mode 100644
+index 0000000..6bbdfd2
+--- /dev/null
++++ b/ggml/src/ggml-cpu/arch/arm/iqk_x4.c
+@@ -0,0 +1,1007 @@
++// BONSAI_MOE_X4: a four-weight-row q2_0 x q8_0 kernel ported from ik_llama.cpp.
++//
++// Our arm64 q2_0 vec_dot handles one weight row per call (type_traits nrows = 1,
++// assert(nrc == 1)) and reloads the quantised activation for every row. ik's
++// mul_mat_q2_0_q8_0_x4 (ggml/src/iqk/iqk_gemm_legacy_quants.cpp) loops nrc_x
++// weight rows with the activation resident and packs two block scales into one
++// float32x4 so one vfmaq_f32 retires 128 weights.
++//
++// mode 1 (BONSAI_MOE_X4=1): four rows share one activation load; each 32-weight
++// group is accumulated with the same vmlaq_n_f32 and block order as the
++// reference, so this is bit-exact against ggml_vec_dot_q2_0_q8_0 with the
++// shipping dual-accumulator arithmetic. Verified by tools/s6_q2_0_x4_test.c.
++//
++// mode 2 (BONSAI_MOE_X4=2): also packs four group sums into one int32x4 with two
++// vpaddq_s32 and scales them with a per-lane float32x4. FP association changes,
++// so this is near-exact only and does not satisfy the token-identity gate.
++//
++// Not ported: ik's block_q8_0_x4 repacked activation. Our y side stays plain
++// block_q8_0, which costs two 16-byte loads per group where ik needs one, and
++// that remainder is a follow-up rather than part of this change.
++//
++// Default is off. An unmeasured kernel change is not enabled in this project.
++
++#define GGML_COMMON_IMPL_C
++#include "ggml-common.h"
++#include "ggml-quants.h"
++#include "ggml-impl.h"
++#include "ggml-cpu.h"
++#include "simd-mappings.h"
++
++#include "../../ggml-cpu-impl.h"
++
++#include <stdlib.h>
++#include <assert.h>
++
++#if defined(__aarch64__) && defined(__ARM_NEON)
++
++// 0 off, 1 bit-exact shared-activation rows, 2 ik-style packed accumulate,
++// 3 bit-exact two-row (spill-free) variant of 1
++// Default is 1 (mode 1, bit-exact) as of the Stage 6 on-device shootout: it passed Gate 1
++// (token-identical to the shipping kernel) and measured +2.71% / +3.19% decode in the two
++// mirrored passes. Mode 2 is faster (+7.39% in pass 1) but is near-exact, so it is judged by
++// Gate 3 and stays opt-in: BONSAI_MOE_X4=2. Mode 3 is the same arithmetic as mode 1 with half
++// the accumulator pressure (four weight rows in two passes), so it should compile to a stack
++// frame of zero; it is opt-in until an arm measures it: BONSAI_MOE_X4=3.
++int bonsai_q2_0_x4_mode(void) {
++    static int mode = -1;
++    if (mode < 0) {
++        const char * e = getenv("BONSAI_MOE_X4");
++        const int m = e ? atoi(e) : 1;
++        mode = (m >= 0 && m <= 3) ? m : 1;
++    }
++    return mode;
++}
++
++// ik's expansion table: one 16-byte load plus four vqtbl1q_u8 expands a whole 64-weight
++// block into four 16-weight int8 groups. 00 -> -1, 01 -> 0, 10 -> +1, 11 -> +2.
++static const uint8_t k_q2_0_shuff[64] = {
++     0,  0,  0,  0,  1,  1,  1,  1,  2,  2,  2,  2,  3,  3,  3,  3,
++     4,  4,  4,  4,  5,  5,  5,  5,  6,  6,  6,  6,  7,  7,  7,  7,
++     8,  8,  8,  8,  9,  9,  9,  9, 10, 10, 10, 10, 11, 11, 11, 11,
++    12, 12, 12, 12, 13, 13, 13, 13, 14, 14, 14, 14, 15, 15, 15, 15,
++};
++static const int8_t k_q2_0_shifts[16] = { 0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6 };
++
++// Seven registers held for the whole loop. Everything else in the function has to fit in
++// the remaining 25, which is why the row count per pass is the knob that decides spills.
++#define BONSAI_Q2_0_TABLES() \
++    const uint8x16_t shuff0 = vld1q_u8(k_q2_0_shuff +  0); \
++    const uint8x16_t shuff1 = vld1q_u8(k_q2_0_shuff + 16); \
++    const uint8x16_t shuff2 = vld1q_u8(k_q2_0_shuff + 32); \
++    const uint8x16_t shuff3 = vld1q_u8(k_q2_0_shuff + 48); \
++    const int8x16_t  shifts = vld1q_s8(k_q2_0_shifts); \
++    const uint8x16_t mask2  = vdupq_n_u8(0x03); \
++    const int8x16_t  one    = vdupq_n_s8(1)
++
++#define BONSAI_Q2_0_DEQ(QS, Q0, Q1, Q2, Q3) do { \
++        const uint8x16_t bits_ = vld1q_u8(QS); \
++        Q0 = vqtbl1q_u8(bits_, shuff0); \
++        Q1 = vqtbl1q_u8(bits_, shuff1); \
++        Q2 = vqtbl1q_u8(bits_, shuff2); \
++        Q3 = vqtbl1q_u8(bits_, shuff3); \
++        Q0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshlq_u8(Q0, shifts), mask2)), one); \
++        Q1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshlq_u8(Q1, shifts), mask2)), one); \
++        Q2 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshlq_u8(Q2, shifts), mask2)), one); \
++        Q3 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshlq_u8(Q3, shifts), mask2)), one); \
++    } while (0)
++
++// One row over one 64-weight block, reference accumulation: one vdot chain and one
++// vmlaq_n_f32 per 32-weight q8_0 block, exactly as ggml_vec_dot_q2_0_q8_0 does it.
++#define BONSAI_Q2_0_ROW(ACC, QS, YA0, YA1, DYA, YB0, YB1, DYB) do { \
++        int8x16_t q0_, q1_, q2_, q3_; \
++        BONSAI_Q2_0_DEQ(QS, q0_, q1_, q2_, q3_); \
++        const int32x4_t pa_ = ggml_vdotq_s32(ggml_vdotq_s32(vdupq_n_s32(0), q0_, YA0), q1_, YA1); \
++        const int32x4_t pb_ = ggml_vdotq_s32(ggml_vdotq_s32(vdupq_n_s32(0), q2_, YB0), q3_, YB1); \
++        (ACC) = vmlaq_n_f32((ACC), vcvtq_f32_s32(pa_), DYA); \
++        (ACC) = vmlaq_n_f32((ACC), vcvtq_f32_s32(pb_), DYB); \
++    } while (0)
++
++
++// Lean dequant constants: ONE index vector, the left-shift amounts, and the -1 bias. Group k is
++// the four bytes at qs + 4k, each repeated four times, so a 4-byte rotation of the source gives
++// every group and the field extract needs no 0x03 mask: shifting left by (6 - 2*field) and then
++// right by 6 keeps exactly the field. Three constant registers instead of seven.
++static const int8_t k_q2_0_shifts_l[16] = { 6, 4, 2, 0, 6, 4, 2, 0, 6, 4, 2, 0, 6, 4, 2, 0 };
++#define BONSAI_Q2_0_TABLES_LEAN() \
++    const uint8x16_t idx4   = vld1q_u8(k_q2_0_shuff); \
++    const int8x16_t  shlft  = vld1q_s8(k_q2_0_shifts_l); \
++    const uint8x16_t one    = vdupq_n_u8(1)
++
++static inline float32x4_t bonsai_q2_0_scale4(float s0, float s1, float s2, float s3) {
++    float32_t q[4] = { s0, s1, s2, s3 };
++    return vld1q_f32(q);
++}
++
++// Four consecutive weight rows (bx bytes apart) against one activation row, four rows per
++// pass over the activation. Results go to s[0..3]. n is a multiple of QK2_0 and the caller
++// guarantees the four rows are in range. Bit-exact against ggml_vec_dot_q2_0_q8_0.
++static __attribute__((noinline)) void bonsai_x4_rows4_mode1(int nb, float * GGML_RESTRICT s,
++                                  const void * GGML_RESTRICT vx, size_t bx,
++                                  const void * GGML_RESTRICT vy) {
++    const block_q2_0 * GGML_RESTRICT x0 = (const block_q2_0 *) vx;
++    const block_q2_0 * GGML_RESTRICT x1 = (const block_q2_0 *) ((const uint8_t *) vx +     bx);
++    const block_q2_0 * GGML_RESTRICT x2 = (const block_q2_0 *) ((const uint8_t *) vx + 2 * bx);
++    const block_q2_0 * GGML_RESTRICT x3 = (const block_q2_0 *) ((const uint8_t *) vx + 3 * bx);
++    const block_q8_0 * GGML_RESTRICT y  = (const block_q8_0 *) vy;
++
++    BONSAI_Q2_0_TABLES();
++
++    // One block for all four rows. Activation blocks load once; every row keeps its own
++    // block scale.
++#define BONSAI_X4_BLOCK(IDX, R0, R1, R2, R3) do { \
++        const block_q8_0 * yA_ = &y[2 * (IDX) + 0]; \
++        const block_q8_0 * yB_ = &y[2 * (IDX) + 1]; \
++        const int8x16_t yA0_ = vld1q_s8(yA_->qs +  0); \
++        const int8x16_t yA1_ = vld1q_s8(yA_->qs + 16); \
++        const int8x16_t yB0_ = vld1q_s8(yB_->qs +  0); \
++        const int8x16_t yB1_ = vld1q_s8(yB_->qs + 16); \
++        const float dyA_ = GGML_CPU_FP16_TO_FP32(yA_->d); \
++        const float dyB_ = GGML_CPU_FP16_TO_FP32(yB_->d); \
++        const float d0_ = GGML_CPU_FP16_TO_FP32(x0[(IDX)].d); \
++        const float d1_ = GGML_CPU_FP16_TO_FP32(x1[(IDX)].d); \
++        const float d2_ = GGML_CPU_FP16_TO_FP32(x2[(IDX)].d); \
++        const float d3_ = GGML_CPU_FP16_TO_FP32(x3[(IDX)].d); \
++        BONSAI_Q2_0_ROW(R0, x0[(IDX)].qs, yA0_, yA1_, d0_ * dyA_, yB0_, yB1_, d0_ * dyB_); \
++        BONSAI_Q2_0_ROW(R1, x1[(IDX)].qs, yA0_, yA1_, d1_ * dyA_, yB0_, yB1_, d1_ * dyB_); \
++        BONSAI_Q2_0_ROW(R2, x2[(IDX)].qs, yA0_, yA1_, d2_ * dyA_, yB0_, yB1_, d2_ * dyB_); \
++        BONSAI_Q2_0_ROW(R3, x3[(IDX)].qs, yA0_, yA1_, d3_ * dyA_, yB0_, yB1_, d3_ * dyB_); \
++    } while (0)
++
++    // Two accumulators per row alternating even and odd blocks, matching the shipping
++    // reference kernel exactly.
++    float32x4_t e0 = vdupq_n_f32(0.0f), e1 = vdupq_n_f32(0.0f);
++    float32x4_t e2 = vdupq_n_f32(0.0f), e3 = vdupq_n_f32(0.0f);
++    float32x4_t o0 = vdupq_n_f32(0.0f), o1 = vdupq_n_f32(0.0f);
++    float32x4_t o2 = vdupq_n_f32(0.0f), o3 = vdupq_n_f32(0.0f);
++
++    int i = 0;
++    for (; i + 1 < nb; i += 2) {
++        BONSAI_X4_BLOCK(i,     e0, e1, e2, e3);
++        BONSAI_X4_BLOCK(i + 1, o0, o1, o2, o3);
++    }
++    if (i < nb) {
++        BONSAI_X4_BLOCK(i, e0, e1, e2, e3);
++    }
++
++    s[0] = vaddvq_f32(vaddq_f32(e0, o0));
++    s[1] = vaddvq_f32(vaddq_f32(e1, o1));
++    s[2] = vaddvq_f32(vaddq_f32(e2, o2));
++    s[3] = vaddvq_f32(vaddq_f32(e3, o3));
++
++#undef BONSAI_X4_BLOCK
++}
++
++// ---------------------------------------------------------------------------
++// BONSAI_Q8_0_X4: contiguous, 16-byte-aligned activation records (prototype).
++//
++// block_q8_0 is {ggml_half d; int8_t qs[32]} = 34 B, so in the quantised activation row the
++// 16-byte quant loads land at 2 + 34k mod 16 and every second load straddles a 16-byte boundary.
++// This record packs FOUR blocks (the pair of activation blocks one q2_0 block consumes, plus the
++// next pair, i.e. exactly one even/odd loop iteration of the kernel) as 128 contiguous int8
++// followed by the four scales, padded to 144 B so the record and each 32-byte quant half are
++// 16-byte aligned. The values are copied, never recomputed, so the arithmetic is untouched.
++//
++// The repack is built ONCE per 16-row weight block in the caller, where the same activation row
++// is read by sixteen weight rows; per 4-row call it would be a pure loss.
++// ---------------------------------------------------------------------------
++#define BONSAI_Q8_0_X4_STRIDE 144
++#define BONSAI_Q8_0_X4_MAX_BYTES 8192
++
++typedef struct {
++    int8_t    qs[4][32];
++    ggml_half d[4];
++    int8_t    pad[8];
++} bonsai_block_q8_0_x4;
++
++// BONSAI_MOE_X4_PREFILL_PACKED: use the packed-activation variant of the shipped tile.
++int bonsai_q2_0_x4_prefill_packed_mode(void) {
++    static int mode = -1;
++    if (mode < 0) {
++        const char * e = getenv("BONSAI_MOE_X4_PREFILL_PACKED");
++        mode = (e && atoi(e) > 0) ? 1 : 0;
++    }
++    return mode;
++}
++
++// 0 = off, 1 = the Stage 7 variant (row-pair kernel, tested on the losing MOE_X4=3 shape),
++// 2 = the Stage 9 variant: the SAME 128-byte packed activation, read by the winning four-row
++// decode kernel (MOE_X4=1's accumulation order). 2 is the one that can touch n = 1 decode.
++int bonsai_q8_0_x4_mode(void) {
++    static int mode = -1;
++    if (mode < 0) {
++        const char * e = getenv("BONSAI_Q8_0_X4");
++        const int m = e ? atoi(e) : 0;
++        mode = (m <= 0) ? 0 : (m >= 2 ? 2 : 1);
++    }
++    return mode;
++}
++
++// 0 when the row cannot be repacked inside the caller's scratch buffer
++int bonsai_q8_0_x4_bytes(int n) {
++    if (n % QK2_0 != 0) {
++        return 0;
++    }
++    const int nrec = n / 128 + ((n % 128) ? 1 : 0);
++    const int bytes = nrec * BONSAI_Q8_0_X4_STRIDE;
++    return bytes <= BONSAI_Q8_0_X4_MAX_BYTES ? bytes : 0;
++}
++
++void bonsai_pack_q8_0_x4(int n, void * GGML_RESTRICT dst, const void * GGML_RESTRICT src) {
++    const int nby  = n / QK8_0;
++    const int nrec = (nby + 3) / 4;
++    const block_q8_0 * GGML_RESTRICT y = (const block_q8_0 *) src;
++    uint8_t * GGML_RESTRICT out = (uint8_t *) dst;
++    for (int r = 0; r < nrec; ++r) {
++        uint8_t * rec = out + (size_t) r * BONSAI_Q8_0_X4_STRIDE;
++        for (int k = 0; k < 4; ++k) {
++            const int b = 4 * r + k;
++            if (b < nby) {
++                memcpy(rec + 32 * k, y[b].qs, 32);
++                memcpy(rec + 128 + 2 * k, &y[b].d, 2);
++            } else {
++                memset(rec + 32 * k, 0, 32);
++                memset(rec + 128 + 2 * k, 0, 2);
++            }
++        }
++    }
++}
++
++// activation accessors: one pair per layout, so the arithmetic below has a single definition
++static inline const int8_t * bonsai_yq_plain(const void * vy, int blk) {
++    return ((const block_q8_0 *) vy)[blk].qs;
++}
++static inline ggml_half bonsai_yd_plain(const void * vy, int blk) {
++    return ((const block_q8_0 *) vy)[blk].d;
++}
++static inline const int8_t * bonsai_yq_packed(const void * vy, int blk) {
++    return (const int8_t *) ((const uint8_t *) vy + (size_t) (blk / 4) * BONSAI_Q8_0_X4_STRIDE
++                                                                + (size_t) (blk % 4) * 32);
++}
++static inline ggml_half bonesai_pk_scale(const void * vy, int rec, int scale_idx) {
++    ggml_half h;
++    memcpy(&h, (const uint8_t *) vy + (size_t) rec * BONSAI_Q8_0_X4_STRIDE + 128
++                                  + (size_t) scale_idx * 2, sizeof(h));
++    return h;
++}
++
++static inline ggml_half bonsai_yd_packed(const void * vy, int blk) {
++    ggml_half h;
++    memcpy(&h, (const uint8_t *) vy + (size_t) (blk / 4) * BONSAI_Q8_0_X4_STRIDE
++                                  + 128 + (size_t) (blk % 4) * 2, sizeof(h));
++    return h;
++}
++
++// ---------------------------------------------------------------------------
++// Shared arithmetic macros for the row-pair kernels below. They reference idx4 / shlft / one,
++// which the enclosing function must have introduced with BONSAI_Q2_0_TABLES_LEAN().
++// ---------------------------------------------------------------------------
++// One 16-weight group: four source bytes repeated four times, then a two-shift maskless extract
++// (field k lands in the low two bits) and the -1 that maps the 2-bit field to -1..2.
++#define BONSAI_Q2_0_GROUP_LEAN(V, Q) do { \
++        (Q) = vqtbl1q_u8((V), idx4); \
++        (Q) = vreinterpretq_s8_u8(vsubq_u8(vshrq_n_u8(vshlq_u8((Q), shlft), 6), one)); \
++    } while (0)
++
++#define BONSAI_Q2_0_DEQ_LEAN(QS, Q0, Q1, Q2, Q3) do { \
++        const uint8x16_t bits_ = vld1q_u8(QS); \
++        BONSAI_Q2_0_GROUP_LEAN(bits_, Q0); \
++        BONSAI_Q2_0_GROUP_LEAN(vextq_u8(bits_, bits_,  4), Q1); \
++        BONSAI_Q2_0_GROUP_LEAN(vextq_u8(bits_, bits_,  8), Q2); \
++        BONSAI_Q2_0_GROUP_LEAN(vextq_u8(bits_, bits_, 12), Q3); \
++    } while (0)
++
++#define BONSAI_Q2_0_GRP(QA, QB, YL, YH) \
++    ggml_vdotq_s32(ggml_vdotq_s32(vdupq_n_s32(0), QA, YL), QB, YH)
++
++// One weight row over one 64-weight block, reference accumulation order: one int32x4 per
++// 32-weight group and one vmlaq_n_f32 with the product of the two block scales.
++#define BONSAI_Q2_0_ROW_LEAN(ACC, XR, IDX, YL, YH, Y0, Y1, DYA, DYB) do { \
++        int8x16_t q0_, q1_, q2_, q3_; \
++        BONSAI_Q2_0_DEQ_LEAN((XR)[(IDX)].qs, q0_, q1_, q2_, q3_); \
++        const float dd_ = GGML_CPU_FP16_TO_FP32((XR)[(IDX)].d); \
++        (ACC) = vmlaq_n_f32((ACC), vcvtq_f32_s32(BONSAI_Q2_0_GRP(q0_, q1_, Y0, Y1)), dd_ * DYA); \
++        (ACC) = vmlaq_n_f32((ACC), vcvtq_f32_s32(BONSAI_Q2_0_GRP(q2_, q3_, YL, YH)), dd_ * DYB); \
++    } while (0)
++
++// One block, two weight rows: the activation vectors load once and serve both rows.
++#define BONSAI_X4_BLOCK2(IDX, R0, R1, X0, X1, VY, YQ, YD) do { \
++        const int8_t * yAq_ = YQ((VY), 2 * (IDX) + 0); \
++        const int8_t * yBq_ = YQ((VY), 2 * (IDX) + 1); \
++        const int8x16_t y0_ = vld1q_s8(yAq_ +  0); \
++        const int8x16_t y1_ = vld1q_s8(yAq_ + 16); \
++        const int8x16_t y2_ = vld1q_s8(yBq_ +  0); \
++        const int8x16_t y3_ = vld1q_s8(yBq_ + 16); \
++        const float dyA_ = GGML_CPU_FP16_TO_FP32(YD((VY), 2 * (IDX) + 0)); \
++        const float dyB_ = GGML_CPU_FP16_TO_FP32(YD((VY), 2 * (IDX) + 1)); \
++        BONSAI_Q2_0_ROW_LEAN(R0, (X0), IDX, y2_, y3_, y0_, y1_, dyA_, dyB_); \
++        BONSAI_Q2_0_ROW_LEAN(R1, (X1), IDX, y2_, y3_, y0_, y1_, dyA_, dyB_); \
++    } while (0)
++
++// ---------------------------------------------------------------------------
++// The four-weight-row decode kernel, two rows per pass over the activation.
++//
++// Mode 1 keeps eight accumulators, four expanded weight registers, four activation registers and
++// seven constant registers live at once, which does not fit in 32 vector registers: clang spills
++// ~55 values (432 B frame). Halving the rows per pass brings that to four accumulators and three
++// constant registers, with no recomputation: this variant compiles to a 0 B frame and zero local
++// stack traffic. The same body is generated once per activation layout (BONSAI_Q8_0_X4).
++// ---------------------------------------------------------------------------
++#define BONSAI_DEFINE_X4_ROWS2(NAME, YQ, YD)                                            \
++static __attribute__((noinline)) void NAME(int nb, float * GGML_RESTRICT s,             \
++                                  const void * GGML_RESTRICT vx, size_t bx,             \
++                                  const void * GGML_RESTRICT vy) {                      \
++    BONSAI_Q2_0_TABLES_LEAN();                                                          \
++                                                                                        \
++    for (int pair = 0; pair < 2; ++pair) {                                              \
++        const block_q2_0 * GGML_RESTRICT x0 = (const block_q2_0 *) ((const uint8_t *) vx + (size_t) (2 * pair    ) * bx); \
++        const block_q2_0 * GGML_RESTRICT x1 = (const block_q2_0 *) ((const uint8_t *) vx + (size_t) (2 * pair + 1) * bx); \
++                                                                                        \
++        float32x4_t e0 = vdupq_n_f32(0.0f), e1 = vdupq_n_f32(0.0f);                     \
++        float32x4_t o0 = vdupq_n_f32(0.0f), o1 = vdupq_n_f32(0.0f);                     \
++                                                                                        \
++        int i = 0;                                                                      \
++        for (; i + 1 < nb; i += 2) {                                                    \
++            BONSAI_X4_BLOCK2(i,     e0, e1, x0, x1, vy, YQ, YD);                        \
++            BONSAI_X4_BLOCK2(i + 1, o0, o1, x0, x1, vy, YQ, YD);                        \
++        }                                                                               \
++        if (i < nb) {                                                                   \
++            BONSAI_X4_BLOCK2(i, e0, e1, x0, x1, vy, YQ, YD);                            \
++        }                                                                               \
++                                                                                        \
++        s[2 * pair + 0] = vaddvq_f32(vaddq_f32(e0, o0));                                \
++        s[2 * pair + 1] = vaddvq_f32(vaddq_f32(e1, o1));                                \
++    }                                                                                   \
++}
++
++BONSAI_DEFINE_X4_ROWS2(bonsai_x4_rows2_plain,  bonsai_yq_plain,  bonsai_yd_plain)
++BONSAI_DEFINE_X4_ROWS2(bonsai_x4_rows2_packed, bonsai_yq_packed, bonsai_yd_packed)
++
++// mode 2: near-exact (FP re-associated by construction), kept to bound what ik's packed
++// accumulate buys. Judged by Gate 3, never shipped as a default.
++static __attribute__((noinline)) void bonsai_x4_rows4_mode2(int nb, float * GGML_RESTRICT s,
++                                  const void * GGML_RESTRICT vx, size_t bx,
++                                  const void * GGML_RESTRICT vy) {
++    const block_q2_0 * GGML_RESTRICT x0 = (const block_q2_0 *) vx;
++    const block_q2_0 * GGML_RESTRICT x1 = (const block_q2_0 *) ((const uint8_t *) vx +     bx);
++    const block_q2_0 * GGML_RESTRICT x2 = (const block_q2_0 *) ((const uint8_t *) vx + 2 * bx);
++    const block_q2_0 * GGML_RESTRICT x3 = (const block_q2_0 *) ((const uint8_t *) vx + 3 * bx);
++    const block_q8_0 * GGML_RESTRICT y  = (const block_q8_0 *) vy;
++
++    BONSAI_Q2_0_TABLES();
++
++    // Two nested vpaddq_s32 reduce the four 32-weight group sums of a block pair into lanes
++    // {A.lo, A.hi, B.lo, B.hi}; one vfmaq_f32 then retires 128 weights per row.
++#define BONSAI_X4_ROW_PACKED(ACC, QSA, QSB, Y0L, Y0H, Y1L, Y1H, Y2L, Y2H, Y3L, Y3H, S4) do { \
++        int8x16_t ca0_, ca1_, ca2_, ca3_, cb0_, cb1_, cb2_, cb3_; \
++        BONSAI_Q2_0_DEQ(QSA, ca0_, ca1_, ca2_, ca3_); \
++        BONSAI_Q2_0_DEQ(QSB, cb0_, cb1_, cb2_, cb3_); \
++        const int32x4_t g0_ = ggml_vdotq_s32(ggml_vdotq_s32(vdupq_n_s32(0), ca0_, Y0L), ca1_, Y0H); \
++        const int32x4_t g1_ = ggml_vdotq_s32(ggml_vdotq_s32(vdupq_n_s32(0), ca2_, Y1L), ca3_, Y1H); \
++        const int32x4_t g2_ = ggml_vdotq_s32(ggml_vdotq_s32(vdupq_n_s32(0), cb0_, Y2L), cb1_, Y2H); \
++        const int32x4_t g3_ = ggml_vdotq_s32(ggml_vdotq_s32(vdupq_n_s32(0), cb2_, Y3L), cb3_, Y3H); \
++        const int32x4_t s4_ = vpaddq_s32(vpaddq_s32(g0_, g1_), vpaddq_s32(g2_, g3_)); \
++        (ACC) = vfmaq_f32((ACC), (S4), vcvtq_f32_s32(s4_)); \
++    } while (0)
++
++    float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
++    float32x4_t a2 = vdupq_n_f32(0.0f), a3 = vdupq_n_f32(0.0f);
++
++    int i = 0;
++    for (; i + 1 < nb; i += 2) {
++        const block_q8_0 * y0 = &y[2 * i + 0];
++        const block_q8_0 * y1 = &y[2 * i + 1];
++        const block_q8_0 * y2 = &y[2 * i + 2];
++        const block_q8_0 * y3 = &y[2 * i + 3];
++
++        const int8x16_t y0l = vld1q_s8(y0->qs +  0), y0h = vld1q_s8(y0->qs + 16);
++        const int8x16_t y1l = vld1q_s8(y1->qs +  0), y1h = vld1q_s8(y1->qs + 16);
++        const int8x16_t y2l = vld1q_s8(y2->qs +  0), y2h = vld1q_s8(y2->qs + 16);
++        const int8x16_t y3l = vld1q_s8(y3->qs +  0), y3h = vld1q_s8(y3->qs + 16);
++
++        const float dY0 = GGML_CPU_FP16_TO_FP32(y0->d);
++        const float dY1 = GGML_CPU_FP16_TO_FP32(y1->d);
++        const float dY2 = GGML_CPU_FP16_TO_FP32(y2->d);
++        const float dY3 = GGML_CPU_FP16_TO_FP32(y3->d);
++        const float dA0 = GGML_CPU_FP16_TO_FP32(x0[i].d);
++        const float dA1 = GGML_CPU_FP16_TO_FP32(x1[i].d);
++        const float dA2 = GGML_CPU_FP16_TO_FP32(x2[i].d);
++        const float dA3 = GGML_CPU_FP16_TO_FP32(x3[i].d);
++        const float dB0 = GGML_CPU_FP16_TO_FP32(x0[i + 1].d);
++        const float dB1 = GGML_CPU_FP16_TO_FP32(x1[i + 1].d);
++        const float dB2 = GGML_CPU_FP16_TO_FP32(x2[i + 1].d);
++        const float dB3 = GGML_CPU_FP16_TO_FP32(x3[i + 1].d);
++
++        BONSAI_X4_ROW_PACKED(a0, x0[i].qs, x0[i + 1].qs, y0l, y0h, y1l, y1h, y2l, y2h, y3l, y3h,
++                             bonsai_q2_0_scale4(dA0 * dY0, dA0 * dY1, dB0 * dY2, dB0 * dY3));
++        BONSAI_X4_ROW_PACKED(a1, x1[i].qs, x1[i + 1].qs, y0l, y0h, y1l, y1h, y2l, y2h, y3l, y3h,
++                             bonsai_q2_0_scale4(dA1 * dY0, dA1 * dY1, dB1 * dY2, dB1 * dY3));
++        BONSAI_X4_ROW_PACKED(a2, x2[i].qs, x2[i + 1].qs, y0l, y0h, y1l, y1h, y2l, y2h, y3l, y3h,
++                             bonsai_q2_0_scale4(dA2 * dY0, dA2 * dY1, dB2 * dY2, dB2 * dY3));
++        BONSAI_X4_ROW_PACKED(a3, x3[i].qs, x3[i + 1].qs, y0l, y0h, y1l, y1h, y2l, y2h, y3l, y3h,
++                             bonsai_q2_0_scale4(dA3 * dY0, dA3 * dY1, dB3 * dY2, dB3 * dY3));
++    }
++    for (; i < nb; ++i) {
++        const block_q8_0 * yA_ = &y[2 * i + 0];
++        const block_q8_0 * yB_ = &y[2 * i + 1];
++        const int8x16_t yA0_ = vld1q_s8(yA_->qs +  0);
++        const int8x16_t yA1_ = vld1q_s8(yA_->qs + 16);
++        const int8x16_t yB0_ = vld1q_s8(yB_->qs +  0);
++        const int8x16_t yB1_ = vld1q_s8(yB_->qs + 16);
++        const float dyA_ = GGML_CPU_FP16_TO_FP32(yA_->d);
++        const float dyB_ = GGML_CPU_FP16_TO_FP32(yB_->d);
++        const float d0_ = GGML_CPU_FP16_TO_FP32(x0[i].d);
++        const float d1_ = GGML_CPU_FP16_TO_FP32(x1[i].d);
++        const float d2_ = GGML_CPU_FP16_TO_FP32(x2[i].d);
++        const float d3_ = GGML_CPU_FP16_TO_FP32(x3[i].d);
++        BONSAI_Q2_0_ROW(a0, x0[i].qs, yA0_, yA1_, d0_ * dyA_, yB0_, yB1_, d0_ * dyB_);
++        BONSAI_Q2_0_ROW(a1, x1[i].qs, yA0_, yA1_, d1_ * dyA_, yB0_, yB1_, d1_ * dyB_);
++        BONSAI_Q2_0_ROW(a2, x2[i].qs, yA0_, yA1_, d2_ * dyA_, yB0_, yB1_, d2_ * dyB_);
++        BONSAI_Q2_0_ROW(a3, x3[i].qs, yA0_, yA1_, d3_ * dyA_, yB0_, yB1_, d3_ * dyB_);
++    }
++
++    s[0] = vaddvq_f32(a0);
++    s[1] = vaddvq_f32(a1);
++    s[2] = vaddvq_f32(a2);
++    s[3] = vaddvq_f32(a3);
++
++#undef BONSAI_X4_ROW_PACKED
++}
++
++void bonsai_vec_dot_q2_0_q8_0_x4(int n, float * GGML_RESTRICT s,
++                                 const void * GGML_RESTRICT vx, size_t bx,
++                                 const void * GGML_RESTRICT vy, int mode) {
++    assert(n % QK2_0 == 0);
++    assert(mode >= 1 && mode <= 3);
++    const int nb = n / QK2_0;
++    if (mode == 1) {
++        bonsai_x4_rows4_mode1(nb, s, vx, bx, vy);
++    } else if (mode == 3) {
++        bonsai_x4_rows2_plain(nb, s, vx, bx, vy);
++    } else {
++        bonsai_x4_rows4_mode2(nb, s, vx, bx, vy);
++    }
++}
++
++// ---------------------------------------------------------------------------
++// BONSAI_Q8_0_X4=2: the winning four-row DECODE kernel over a packed activation row.
++//
++// This is bonsai_x4_rows4_mode1 - the shipped MOE_X4=1 kernel that measured +4.53% over the
++// per-row path - with one change only: the activation comes from the block_q8_0_x4 records that
++// bonsai_pack_q8_0_x4 builds, so the two 32-weight halves of a block are one vld1q_s8_x2 of
++// contiguous memory instead of two 16-byte loads from a 34-byte-strided block_q8_0.
++//
++// The accumulation order is mode 1's exactly: four rows share one expansion of the block, eight
++// accumulators alternate even and odd blocks, and each row resolves as vaddvq(e + o). It is NOT the
++// MOE_X4=3 row-pair loop - that shape lost 3.6% in Stage 8 and must not be reused here.
++//
++// Why decode can use the pack at all: on a single-token step every routed expert of ffn_up_exps and
++// ffn_gate_exps reads the SAME activation row (1 x n_embd), so the caller's cached pack is built once
++// and then hit by every thread and every weight-row chunk. Stage 7's null result came from testing
++// the pack on the losing kernel and repacking once per 16-row block; both of those are fixed here.
++static __attribute__((noinline)) void bonsai_x4_rows4_mode1_packed(int nb, float * GGML_RESTRICT s,
++                                  const void * GGML_RESTRICT vx, size_t bx,
++                                  const void * GGML_RESTRICT vy_packed) {
++    const block_q2_0 * GGML_RESTRICT x0 = (const block_q2_0 *) vx;
++    const block_q2_0 * GGML_RESTRICT x1 = (const block_q2_0 *) ((const uint8_t *) vx +     bx);
++    const block_q2_0 * GGML_RESTRICT x2 = (const block_q2_0 *) ((const uint8_t *) vx + 2 * bx);
++    const block_q2_0 * GGML_RESTRICT x3 = (const block_q2_0 *) ((const uint8_t *) vx + 3 * bx);
++
++    BONSAI_Q2_0_TABLES_LEAN();
++
++// One row over one block with the lean dequant; identical values to BONSAI_Q2_0_ROW.
++#define BONSAI_PK4_ROW(ACC, XR, IDX, YL, YH, Y0, Y1, DYA, DYB) do { \
++        int8x16_t q0_, q1_, q2_, q3_; \
++        BONSAI_Q2_0_DEQ_LEAN((XR)[(IDX)].qs, q0_, q1_, q2_, q3_); \
++        const float dd_ = GGML_CPU_FP16_TO_FP32((XR)[(IDX)].d); \
++        (ACC) = vmlaq_n_f32((ACC), vcvtq_f32_s32(BONSAI_Q2_0_GRP(q0_, q1_, Y0, Y1)), dd_ * DYA); \
++        (ACC) = vmlaq_n_f32((ACC), vcvtq_f32_s32(BONSAI_Q2_0_GRP(q2_, q3_, YL, YH)), dd_ * DYB); \
++    } while (0)
++
++// One weight block, all four rows, activation read from the packed record.
++#define BONSAI_PK4_BLOCK(IDX, R0, R1, R2, R3) do { \
++        const int rec_  = (IDX) / 2; \
++        const int half_ = (IDX) % 2; \
++        const int8_t * yp_ = (const int8_t *) vy_packed \
++                           + (size_t) rec_ * BONSAI_Q8_0_X4_STRIDE + (size_t) half_ * 64; \
++        const int8x16_t yA0_ = vld1q_s8(yp_ +  0); \
++        const int8x16_t yA1_ = vld1q_s8(yp_ + 16); \
++        const int8x16_t yB0_ = vld1q_s8(yp_ + 32); \
++        const int8x16_t yB1_ = vld1q_s8(yp_ + 48); \
++        const float dyA_ = GGML_CPU_FP16_TO_FP32(bonesai_pk_scale(vy_packed, rec_, half_ * 2 + 0)); \
++        const float dyB_ = GGML_CPU_FP16_TO_FP32(bonesai_pk_scale(vy_packed, rec_, half_ * 2 + 1)); \
++        BONSAI_PK4_ROW(R0, x0, IDX, yB0_, yB1_, yA0_, yA1_, dyA_, dyB_); \
++        BONSAI_PK4_ROW(R1, x1, IDX, yB0_, yB1_, yA0_, yA1_, dyA_, dyB_); \
++        BONSAI_PK4_ROW(R2, x2, IDX, yB0_, yB1_, yA0_, yA1_, dyA_, dyB_); \
++        BONSAI_PK4_ROW(R3, x3, IDX, yB0_, yB1_, yA0_, yA1_, dyA_, dyB_); \
++    } while (0)
++
++    float32x4_t e0 = vdupq_n_f32(0.0f), e1 = vdupq_n_f32(0.0f);
++    float32x4_t e2 = vdupq_n_f32(0.0f), e3 = vdupq_n_f32(0.0f);
++    float32x4_t o0 = vdupq_n_f32(0.0f), o1 = vdupq_n_f32(0.0f);
++    float32x4_t o2 = vdupq_n_f32(0.0f), o3 = vdupq_n_f32(0.0f);
++
++    int i = 0;
++    for (; i + 1 < nb; i += 2) {
++        BONSAI_PK4_BLOCK(i,     e0, e1, e2, e3);
++        BONSAI_PK4_BLOCK(i + 1, o0, o1, o2, o3);
++    }
++    if (i < nb) {
++        BONSAI_PK4_BLOCK(i, e0, e1, e2, e3);
++    }
++
++    s[0] = vaddvq_f32(vaddq_f32(e0, o0));
++    s[1] = vaddvq_f32(vaddq_f32(e1, o1));
++    s[2] = vaddvq_f32(vaddq_f32(e2, o2));
++    s[3] = vaddvq_f32(vaddq_f32(e3, o3));
++
++#undef BONSAI_PK4_BLOCK
++#undef BONSAI_PK4_ROW
++}
++
++// 4 weight rows x 2 token columns, both token rows read from a packed activation row.
++//
++// Same arithmetic as bonsai_vec_dot_q2_0_q8_0_x4t2 (the tile that ships) and the same bit-exactness,
++// but the activation comes from the block_q8_0_x4 layout ik uses: 128 contiguous int8 quants plus
++// four fp16 scales per record, so a 32-weight group is one vld1q_s8_x2 instead of two 16-byte loads
++// from a 34-byte-strided block_q8_0. One record is exactly two q2_0 blocks, i.e. the even/odd pair the
++// loop already walks, so the accumulation order is untouched.
++//
++// Row-outer like x4t2 (four accumulators live, not sixteen): the weight block is expanded once and
++// used for both token columns, and the two token rows are visited per row rather than per block.
++int bonsai_vec_dot_q2_0_q8_0_x4t2_packed(int n,
++                                         float * GGML_RESTRICT s0, float * GGML_RESTRICT s1,
++                                         const void * GGML_RESTRICT vx, size_t bx,
++                                         const void * GGML_RESTRICT vy0,
++                                         const void * GGML_RESTRICT vy1) {
++    const int nb = n / QK2_0;
++    assert(n % QK2_0 == 0);
++
++    BONSAI_Q2_0_TABLES();
++
++// One weight block IDX, both token columns. The activation for the block is two 32-byte halves of
++// one 128-byte record; each half is one vld1q_s8_x2 (two registers) for 32 weights.
++#define BONSAI_PK2_BLOCK(IDX, A0, A1) do { \
++        const int rec_ = (IDX) / 2; \
++        const size_t off_ = (size_t) ((IDX) % 2) * 64; \
++        const int8_t * p0_ = (const int8_t *) vy0 + (size_t) rec_ * BONSAI_Q8_0_X4_STRIDE + off_; \
++        const int8_t * p1_ = (const int8_t *) vy1 + (size_t) rec_ * BONSAI_Q8_0_X4_STRIDE + off_; \
++        const ggml_half d0a_ = bonesai_pk_scale(vy0, rec_, ((IDX) % 2) * 2 + 0); \
++        const ggml_half d0b_ = bonesai_pk_scale(vy0, rec_, ((IDX) % 2) * 2 + 1); \
++        const ggml_half d1a_ = bonesai_pk_scale(vy1, rec_, ((IDX) % 2) * 2 + 0); \
++        const ggml_half d1b_ = bonesai_pk_scale(vy1, rec_, ((IDX) % 2) * 2 + 1); \
++        int8x16_t q0_, q1_, q2_, q3_; \
++        BONSAI_Q2_0_DEQ(x[(IDX)].qs, q0_, q1_, q2_, q3_); \
++        const float dx_ = GGML_CPU_FP16_TO_FP32(x[(IDX)].d); \
++        { \
++            const int8x16_t ya = vld1q_s8(p0_ +  0), yb = vld1q_s8(p0_ + 16); \
++            const int8x16_t yc = vld1q_s8(p0_ + 32), yd = vld1q_s8(p0_ + 48); \
++            (A0) = vmlaq_n_f32((A0), vcvtq_f32_s32(BONSAI_Q2_0_GRP(q0_, q1_, ya, yb)), dx_ * GGML_CPU_FP16_TO_FP32(d0a_)); \
++            (A0) = vmlaq_n_f32((A0), vcvtq_f32_s32(BONSAI_Q2_0_GRP(q2_, q3_, yc, yd)), dx_ * GGML_CPU_FP16_TO_FP32(d0b_)); \
++        } \
++        { \
++            const int8x16_t ya = vld1q_s8(p1_ +  0), yb = vld1q_s8(p1_ + 16); \
++            const int8x16_t yc = vld1q_s8(p1_ + 32), yd = vld1q_s8(p1_ + 48); \
++            (A1) = vmlaq_n_f32((A1), vcvtq_f32_s32(BONSAI_Q2_0_GRP(q0_, q1_, ya, yb)), dx_ * GGML_CPU_FP16_TO_FP32(d1a_)); \
++            (A1) = vmlaq_n_f32((A1), vcvtq_f32_s32(BONSAI_Q2_0_GRP(q2_, q3_, yc, yd)), dx_ * GGML_CPU_FP16_TO_FP32(d1b_)); \
++        } \
++    } while (0)
++
++    for (int ix = 0; ix < 4; ++ix) {
++        const block_q2_0 * GGML_RESTRICT x = (const block_q2_0 *) ((const uint8_t *) vx + (size_t) ix * bx);
++        float32x4_t ve0 = vdupq_n_f32(0.0f), ve1 = vdupq_n_f32(0.0f);
++        float32x4_t vo0 = vdupq_n_f32(0.0f), vo1 = vdupq_n_f32(0.0f);
++        int i = 0;
++        for (; i + 1 < nb; i += 2) {
++            BONSAI_PK2_BLOCK(i,     ve0, ve1);
++            BONSAI_PK2_BLOCK(i + 1, vo0, vo1);
++        }
++        if (i < nb) { BONSAI_PK2_BLOCK(i, ve0, ve1); }
++        s0[ix] = vaddvq_f32(vaddq_f32(ve0, vo0));
++        s1[ix] = vaddvq_f32(vaddq_f32(ve1, vo1));
++    }
++
++#undef BONSAI_PK2_BLOCK
++    return 1;
++}
++
++// Packed-activation entry point (BONSAI_Q8_0_X4).// Packed-activation entry point (BONSAI_Q8_0_X4). vy_packed is a row built by
++// bonsai_pack_q8_0_x4; the arithmetic is the row-pair kernel above with a different accessor.
++void bonsai_vec_dot_q2_0_q8_0_x4_packed(int n, float * GGML_RESTRICT s,
++                                        const void * GGML_RESTRICT vx, size_t bx,
++                                        const void * GGML_RESTRICT vy_packed) {
++    assert(n % QK2_0 == 0);
++    bonsai_x4_rows2_packed(n / QK2_0, s, vx, bx, vy_packed);
++}
++
++// BONSAI_Q8_0_X4=2 entry point: the four-row decode kernel over a packed activation row.
++void bonsai_vec_dot_q2_0_q8_0_x4_packed4(int n, float * GGML_RESTRICT s,
++                                         const void * GGML_RESTRICT vx, size_t bx,
++                                         const void * GGML_RESTRICT vy_packed) {
++    assert(n % QK2_0 == 0);
++    bonsai_x4_rows4_mode1_packed(n / QK2_0, s, vx, bx, vy_packed);
++}
++
++// ---------------------------------------------------------------------------
++// BONSAI_Q3K_X4: four-weight-row q3_K x q8_K, sharing the q8_K activation load.
++//
++// Dense q3_K measured 20.6 ms/token (11.9% of decode) at only 22.6 GiB/s while
++// every other dense type sits at 43-50 GiB/s. The reason is the ratio: at
++// nrc = 1 the kernel streams a 2920 B q8_K activation row for every 1100 B
++// q3_K weight row. block_q8_K is 292 B per 256 weights (9.13 bits/weight)
++// against 110 B for block_q3_K (3.44 bits/weight), so 3.65x more activation
++// bytes than weight bytes are loaded per row.
++//
++// This kernel keeps the q8_K loads resident across four weight rows. The
++// reference accumulates each 256-weight block into an exact int32 (isum) with a
++// single float `sum += d * isum` per block, and all the per-group terms are
++// integer, so an identical integer accumulation gives a bit-identical result
++// regardless of instruction scheduling or register pressure. Verified
++// bit-exact against ggml_vec_dot_q3_K_q8_K by tools/s6_q3_K_x4_test.c under
++// qemu-aarch64-static.
++//
++// Reference kernel: ggml/src/ggml-cpu/arch/arm/quants.c:2225-2318 (the NEON
++// path; the SVE path is not compiled for -march=armv8.2-a).
++// ---------------------------------------------------------------------------
++int bonsai_q3_K_x4_mode(void) {
++    static int mode = -1;
++    if (mode < 0) {
++        const char * e = getenv("BONSAI_Q3K_X4");
++        mode = (e && atoi(e) > 0) ? 1 : 0;
++    }
++    return mode;
++}
++
++// unpack the 16 signed 6-bit scales of a block_q3_K, exactly as the reference does
++static inline void bonsai_q3_K_scales(const uint8_t * GGML_RESTRICT packed, int8_t * GGML_RESTRICT out) {
++    uint32_t aux[3];
++    uint32_t utmp[4];
++    memcpy(aux, packed, 12);
++    utmp[3] = ((aux[1] >> 4) & 0x0f0f0f0f) | (((aux[2] >> 6) & 0x03030303) << 4);
++    utmp[2] = ((aux[0] >> 4) & 0x0f0f0f0f) | (((aux[2] >> 4) & 0x03030303) << 4);
++    utmp[1] = (aux[1] & 0x0f0f0f0f) | (((aux[2] >> 2) & 0x03030303) << 4);
++    utmp[0] = (aux[0] & 0x0f0f0f0f) | (((aux[2] >> 0) & 0x03030303) << 4);
++    int8_t * scale = (int8_t *) utmp;
++    for (int j = 0; j < 16; ++j) {
++        scale[j] -= 32;
++    }
++    memcpy(out, scale, 16);
++}
++
++// Four consecutive weight rows (bx bytes apart) against one q8_K activation row.
++// Results go to s[0..3]. n is a multiple of QK_K and the caller guarantees the
++// four rows are in range.
++void bonsai_vec_dot_q3_K_q8_K_x4(int n, float * GGML_RESTRICT s,
++                                 const void * GGML_RESTRICT vx, size_t bx,
++                                 const void * GGML_RESTRICT vy, int mode) {
++    assert(n % QK_K == 0);
++    assert(mode == 1);
++    (void) mode;
++
++    const uint32_t kmask1 = 0x03030303;
++    const uint32_t kmask2 = 0x0f0f0f0f;
++    (void) kmask1;
++    (void) kmask2;
++
++    const block_q3_K * GGML_RESTRICT x0 = (const block_q3_K *) vx;
++    const block_q3_K * GGML_RESTRICT x1 = (const block_q3_K *) ((const uint8_t *) vx +     bx);
++    const block_q3_K * GGML_RESTRICT x2 = (const block_q3_K *) ((const uint8_t *) vx + 2 * bx);
++    const block_q3_K * GGML_RESTRICT x3 = (const block_q3_K *) ((const uint8_t *) vx + 3 * bx);
++
++    const block_q8_K * GGML_RESTRICT y = (const block_q8_K *) vy;
++
++    const int nb = n / QK_K;
++
++    const uint8x16_t m3b = vdupq_n_u8(0x3);
++    const int32x4_t  vzero = vdupq_n_s32(0);
++    const uint8x16_t m0 = vdupq_n_u8(1);
++    const uint8x16_t m1 = vshlq_n_u8(m0, 1);
++    const uint8x16_t m2 = vshlq_n_u8(m0, 2);
++    const uint8x16_t m3 = vshlq_n_u8(m0, 3);
++
++    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
++
++    for (int i = 0; i < nb; ++i) {
++        int8_t sc0[16], sc1[16], sc2[16], sc3[16];
++        bonsai_q3_K_scales(x0[i].scales, sc0);
++        bonsai_q3_K_scales(x1[i].scales, sc1);
++        bonsai_q3_K_scales(x2[i].scales, sc2);
++        bonsai_q3_K_scales(x3[i].scales, sc3);
++
++        const uint8_t * GGML_RESTRICT q30 = x0[i].qs;
++        const uint8_t * GGML_RESTRICT q31 = x1[i].qs;
++        const uint8_t * GGML_RESTRICT q32 = x2[i].qs;
++        const uint8_t * GGML_RESTRICT q33 = x3[i].qs;
++
++        ggml_uint8x16x2_t qh0bits = ggml_vld1q_u8_x2(x0[i].hmask);
++        ggml_uint8x16x2_t qh1bits = ggml_vld1q_u8_x2(x1[i].hmask);
++        ggml_uint8x16x2_t qh2bits = ggml_vld1q_u8_x2(x2[i].hmask);
++        ggml_uint8x16x2_t qh3bits = ggml_vld1q_u8_x2(x3[i].hmask);
++
++        const int8_t * GGML_RESTRICT q8 = y[i].qs;
++
++        int32_t isum0 = 0, isum1 = 0, isum2 = 0, isum3 = 0;
++        const int8_t * sp0 = sc0, * sp1 = sc1, * sp2 = sc2, * sp3 = sc3;
++
++        // One row: unpack 128 weights from 32 qs bytes plus the hmask, dot them
++        // against the already-resident q8 registers, accumulate into isum.
++        // Group order, scale order and the (j == 0) hmask shift mirror the
++        // reference exactly.
++#define BONSAI_Q3K_ROW(ISUM, Q3, QHB, SP, Q8B1, Q8B2) do { \
++            const ggml_uint8x16x2_t q3bits_ = ggml_vld1q_u8_x2(Q3); (Q3) += 32; \
++            ggml_uint8x16x4_t q3h_; \
++            ggml_int8x16x4_t  q3b_; \
++            q3h_.val[0] = vshlq_n_u8(vbicq_u8(m0, (QHB).val[0]), 2); \
++            q3h_.val[1] = vshlq_n_u8(vbicq_u8(m0, (QHB).val[1]), 2); \
++            q3h_.val[2] = vshlq_n_u8(vbicq_u8(m1, (QHB).val[0]), 1); \
++            q3h_.val[3] = vshlq_n_u8(vbicq_u8(m1, (QHB).val[1]), 1); \
++            q3b_.val[0] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q3bits_.val[0], m3b)), vreinterpretq_s8_u8(q3h_.val[0])); \
++            q3b_.val[1] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q3bits_.val[1], m3b)), vreinterpretq_s8_u8(q3h_.val[1])); \
++            q3b_.val[2] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits_.val[0], 2), m3b)), vreinterpretq_s8_u8(q3h_.val[2])); \
++            q3b_.val[3] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits_.val[1], 2), m3b)), vreinterpretq_s8_u8(q3h_.val[3])); \
++            (ISUM) += vaddvq_s32(ggml_vdotq_s32(vzero, q3b_.val[0], (Q8B1).val[0])) * (SP)[0]; \
++            (ISUM) += vaddvq_s32(ggml_vdotq_s32(vzero, q3b_.val[1], (Q8B1).val[1])) * (SP)[1]; \
++            (ISUM) += vaddvq_s32(ggml_vdotq_s32(vzero, q3b_.val[2], (Q8B1).val[2])) * (SP)[2]; \
++            (ISUM) += vaddvq_s32(ggml_vdotq_s32(vzero, q3b_.val[3], (Q8B1).val[3])) * (SP)[3]; \
++            q3h_.val[0] = vbicq_u8(m2, (QHB).val[0]); \
++            q3h_.val[1] = vbicq_u8(m2, (QHB).val[1]); \
++            q3h_.val[2] = vshrq_n_u8(vbicq_u8(m3, (QHB).val[0]), 1); \
++            q3h_.val[3] = vshrq_n_u8(vbicq_u8(m3, (QHB).val[1]), 1); \
++            q3b_.val[0] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits_.val[0], 4), m3b)), vreinterpretq_s8_u8(q3h_.val[0])); \
++            q3b_.val[1] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits_.val[1], 4), m3b)), vreinterpretq_s8_u8(q3h_.val[1])); \
++            q3b_.val[2] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits_.val[0], 6), m3b)), vreinterpretq_s8_u8(q3h_.val[2])); \
++            q3b_.val[3] = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q3bits_.val[1], 6), m3b)), vreinterpretq_s8_u8(q3h_.val[3])); \
++            (ISUM) += vaddvq_s32(ggml_vdotq_s32(vzero, q3b_.val[0], (Q8B2).val[0])) * (SP)[4]; \
++            (ISUM) += vaddvq_s32(ggml_vdotq_s32(vzero, q3b_.val[1], (Q8B2).val[1])) * (SP)[5]; \
++            (ISUM) += vaddvq_s32(ggml_vdotq_s32(vzero, q3b_.val[2], (Q8B2).val[2])) * (SP)[6]; \
++            (ISUM) += vaddvq_s32(ggml_vdotq_s32(vzero, q3b_.val[3], (Q8B2).val[3])) * (SP)[7]; \
++            (SP) += 8; \
++        } while (0)
++
++        for (int j = 0; j < QK_K/128; ++j) {
++            // the whole point of the port: the activation is loaded once for all four rows
++            const ggml_int8x16x4_t q8b1 = ggml_vld1q_s8_x4(q8); q8 += 64;
++            const ggml_int8x16x4_t q8b2 = ggml_vld1q_s8_x4(q8); q8 += 64;
++
++            BONSAI_Q3K_ROW(isum0, q30, qh0bits, sp0, q8b1, q8b2);
++            BONSAI_Q3K_ROW(isum1, q31, qh1bits, sp1, q8b1, q8b2);
++            BONSAI_Q3K_ROW(isum2, q32, qh2bits, sp2, q8b1, q8b2);
++            BONSAI_Q3K_ROW(isum3, q33, qh3bits, sp3, q8b1, q8b2);
++
++            if (j == 0) {
++                qh0bits.val[0] = vshrq_n_u8(qh0bits.val[0], 4);
++                qh0bits.val[1] = vshrq_n_u8(qh0bits.val[1], 4);
++                qh1bits.val[0] = vshrq_n_u8(qh1bits.val[0], 4);
++                qh1bits.val[1] = vshrq_n_u8(qh1bits.val[1], 4);
++                qh2bits.val[0] = vshrq_n_u8(qh2bits.val[0], 4);
++                qh2bits.val[1] = vshrq_n_u8(qh2bits.val[1], 4);
++                qh3bits.val[0] = vshrq_n_u8(qh3bits.val[0], 4);
++                qh3bits.val[1] = vshrq_n_u8(qh3bits.val[1], 4);
++            }
++        }
++
++        // identical FP structure to the reference: d is one product, then one fma
++        sum0 += (y[i].d * GGML_CPU_FP16_TO_FP32(x0[i].d)) * (float) isum0;
++        sum1 += (y[i].d * GGML_CPU_FP16_TO_FP32(x1[i].d)) * (float) isum1;
++        sum2 += (y[i].d * GGML_CPU_FP16_TO_FP32(x2[i].d)) * (float) isum2;
++        sum3 += (y[i].d * GGML_CPU_FP16_TO_FP32(x3[i].d)) * (float) isum3;
++
++#undef BONSAI_Q3K_ROW
++    }
++
++    s[0] = sum0;
++    s[1] = sum1;
++    s[2] = sum2;
++    s[3] = sum3;
++}
++
++// 2-token variant of the tile above: same amortisation idea with half the accumulator pressure
++// (4 live accumulators instead of 8). Written to answer a concrete question - whether the tile can
++// be made spill-free at all - after the 4-token version turned out to spill inside its hot loop.
++//
++// The two activation rows arrive as two independent pointers, not as a base plus a byte stride:
++// in ggml_compute_forward_mul_mat_id_one_chunk the row for token t is
++// wdata + (i11 + i12*ne11)*row_size with i12 taken from the router's matrix_rows mapping, so two
++// adjacent expert rows can be an arbitrary distance apart and a stride API would read the wrong
++// data silently. Outputs are two 4-float destinations for the same reason: dst_col is permuted by
++// the same mapping.
++//   s0[ix] = dot(weight row ix, vy0), s1[ix] = dot(weight row ix, vy1), ix = 0..3.
++int bonsai_vec_dot_q2_0_q8_0_x4t2(int n,
++                                  float * GGML_RESTRICT s0, float * GGML_RESTRICT s1,
++                                  const void * GGML_RESTRICT vx, size_t bx,
++                                  const void * GGML_RESTRICT vy0, const void * GGML_RESTRICT vy1) {
++    const int nb = n / QK2_0;
++    assert(n % QK2_0 == 0);
++
++    const uint8x16_t sh0 = vld1q_u8(k_q2_0_shuff +  0);
++    const uint8x16_t sh1 = vld1q_u8(k_q2_0_shuff + 16);
++    const uint8x16_t sh2 = vld1q_u8(k_q2_0_shuff + 32);
++    const uint8x16_t sh3 = vld1q_u8(k_q2_0_shuff + 48);
++    const int8x16_t shifts = vld1q_s8(k_q2_0_shifts);
++    const uint8x16_t mask2 = vdupq_n_u8(0x03);
++    const int8x16_t  one   = vdupq_n_s8(1);
++
++    #define S7B_DEQ(QS, Q0, Q1, Q2, Q3) do { \
++        const uint8x16_t bits_ = vld1q_u8(QS); \
++        Q0 = vqtbl1q_u8(bits_, sh0); Q1 = vqtbl1q_u8(bits_, sh1); \
++        Q2 = vqtbl1q_u8(bits_, sh2); Q3 = vqtbl1q_u8(bits_, sh3); \
++        Q0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshlq_u8(Q0, shifts), mask2)), one); \
++        Q1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshlq_u8(Q1, shifts), mask2)), one); \
++        Q2 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshlq_u8(Q2, shifts), mask2)), one); \
++        Q3 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshlq_u8(Q3, shifts), mask2)), one); \
++    } while (0)
++    #define S7B_GRP(QA, QB, YL, YH) \
++        ggml_vdotq_s32(ggml_vdotq_s32(vdupq_n_s32(0), QA, YL), QB, YH)
++    #define S7B_BLOCK(BLK, A0, A1) do { \
++        int8x16_t q0_, q1_, q2_, q3_; \
++        S7B_DEQ(x[BLK].qs, q0_, q1_, q2_, q3_); \
++        const float dd_ = GGML_CPU_FP16_TO_FP32(x[BLK].d); \
++        { const block_q8_0 * y_ = (const block_q8_0 *) vy0 + 2 * (BLK); \
++          (A0) = vmlaq_n_f32((A0), vcvtq_f32_s32(S7B_GRP(q0_, q1_, vld1q_s8(y_[0].qs), vld1q_s8(y_[0].qs + 16))), dd_ * GGML_CPU_FP16_TO_FP32(y_[0].d)); \
++          (A0) = vmlaq_n_f32((A0), vcvtq_f32_s32(S7B_GRP(q2_, q3_, vld1q_s8(y_[1].qs), vld1q_s8(y_[1].qs + 16))), dd_ * GGML_CPU_FP16_TO_FP32(y_[1].d)); } \
++        { const block_q8_0 * y_ = (const block_q8_0 *) vy1 + 2 * (BLK); \
++          (A1) = vmlaq_n_f32((A1), vcvtq_f32_s32(S7B_GRP(q0_, q1_, vld1q_s8(y_[0].qs), vld1q_s8(y_[0].qs + 16))), dd_ * GGML_CPU_FP16_TO_FP32(y_[0].d)); \
++          (A1) = vmlaq_n_f32((A1), vcvtq_f32_s32(S7B_GRP(q2_, q3_, vld1q_s8(y_[1].qs), vld1q_s8(y_[1].qs + 16))), dd_ * GGML_CPU_FP16_TO_FP32(y_[1].d)); } \
++    } while (0)
++
++    for (int ix = 0; ix < 4; ++ix) {
++        const block_q2_0 * GGML_RESTRICT x = (const block_q2_0 *) ((const uint8_t *) vx + (size_t) ix * bx);
++        float32x4_t e0 = vdupq_n_f32(0.0f), e1 = vdupq_n_f32(0.0f);
++        float32x4_t o0 = vdupq_n_f32(0.0f), o1 = vdupq_n_f32(0.0f);
++        int i = 0;
++        for (; i + 1 < nb; i += 2) {
++            S7B_BLOCK(i,     e0, e1);
++            S7B_BLOCK(i + 1, o0, o1);
++        }
++        if (i < nb) { S7B_BLOCK(i, e0, e1); }
++        s0[ix] = vaddvq_f32(vaddq_f32(e0, o0));
++        s1[ix] = vaddvq_f32(vaddq_f32(e1, o1));
++    }
++    #undef S7B_DEQ
++    #undef S7B_GRP
++    #undef S7B_BLOCK
++    return 1;
++}
++
++#endif // __aarch64__ && __ARM_NEON
++
++// ---------------------------------------------------------------------------
++// BONSAI_MOE_X4_PREFILL: 4 weight rows x 4 token columns (Stage 7, part B #3).
++//
++// Why: during prefill the token loop in ggml_compute_forward_mul_mat_id_one_chunk is OUTER, so the
++// existing x4 kernel is called once per token and re-unpacks the same four weight blocks for every
++// token. At 128 weights that is 16 vector ops of 2-bit expansion plus 4 vqtbl1q_u8 per block, and
++// those unpack ops - not the bytes - are the repeated cost. ik's mul_mat_q2_0_q8_0_x4 loops the
++// weight row OUTSIDE and keeps acc[nrc_y] for the token columns, so one unpack serves every token.
++//
++// Shape chosen to avoid the A3 lesson: the row loop is outer and only 2*ny accumulators are live
++// (ny=4 -> 8 float32x4), instead of 16 for a true 4x4 tile. Per 128 weights that costs a few more
++// activation reloads (they are L1-resident: 136 B against a 3.8x larger activation term) in exchange
++// for a 4x reduction in weight unpack work.
++//
++// Bit-exactness: each (row, token) pair accumulates in the reference order (blocks ascending,
++// alternating even/odd accumulators, one vmlaq_n_f32 per 32-weight group), so the result must match
++// ggml_vec_dot_q2_0_q8_0 exactly - verified by tools/s7_q2_0_x4t_test.c under qemu-aarch64-static.
++// ---------------------------------------------------------------------------
++// Default is 1 (on) as of the Stage 7 on-device shootout: the paired-token loop measured
++// +3.66% and +2.95% prefill in the two mirrored passes (mean +3.31%, its own replication
++// spread 0.39%), was token-identical to the shipped engine on a real 262-token prefill, and
++// was neutral on decode (-0.65% / +4.83%, two signs, i.e. nothing) as it must be, because a
++// single-token decode never enters the paired loop. BONSAI_MOE_X4_PREFILL=0 restores the
++// stock loop.
++// 0 = stock loop, 1 = 4 rows x 2 token columns (default), 2 = 4 rows x 4 token columns.
++// Mode 2 is the Stage 8 candidate (C1): it is the same arithmetic with the token-column
++// count doubled, which is the axis ik amortises on (acc[nrc_y], see STAGE8 Task 1).
++int bonsai_q2_0_x4_prefill_mode(void) {
++    static int mode = -1;
++    if (mode < 0) {
++        const char * e = getenv("BONSAI_MOE_X4_PREFILL");
++        const int m = e ? atoi(e) : 1;
++        mode = (m <= 0) ? 0 : (m == 2 ? 2 : 1);
++    }
++    return mode;
++}
++
++// s0[ix] = dot(weight row ix, activation row 0) ... s3[ix] = dot(weight row ix, activation row 3).
++// The four activation rows arrive as independent pointers for the same reason x4t2's do: in
++// mul_mat_id_one_chunk two routed rows are an arbitrary distance apart, so a stride API would read
++// the wrong data silently. Returns 1 on success.
++int bonsai_vec_dot_q2_0_q8_0_x4t4(int n,
++                                  float * GGML_RESTRICT s0, float * GGML_RESTRICT s1,
++                                  float * GGML_RESTRICT s2, float * GGML_RESTRICT s3,
++                                  const void * GGML_RESTRICT vx, size_t bx,
++                                  const void * GGML_RESTRICT vy0, const void * GGML_RESTRICT vy1,
++                                  const void * GGML_RESTRICT vy2, const void * GGML_RESTRICT vy3) {
++    const int nb = n / QK2_0;
++    assert(n % QK2_0 == 0);
++
++    static const uint8_t k_shuff[64] = {
++         0,  0,  0,  0,  1,  1,  1,  1,  2,  2,  2,  2,  3,  3,  3,  3,
++         4,  4,  4,  4,  5,  5,  5,  5,  6,  6,  6,  6,  7,  7,  7,  7,
++         8,  8,  8,  8,  9,  9,  9,  9, 10, 10, 10, 10, 11, 11, 11, 11,
++        12, 12, 12, 12, 13, 13, 13, 13, 14, 14, 14, 14, 15, 15, 15, 15,
++    };
++    static const int8_t k_shifts[16] = { 0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6 };
++
++    const uint8x16_t sh0 = vld1q_u8(k_shuff +  0);
++    const uint8x16_t sh1 = vld1q_u8(k_shuff + 16);
++    const uint8x16_t sh2 = vld1q_u8(k_shuff + 32);
++    const uint8x16_t sh3 = vld1q_u8(k_shuff + 48);
++    const int8x16_t shifts = vld1q_s8(k_shifts);
++    const uint8x16_t mask2  = vdupq_n_u8(0x03);
++    const int8x16_t  one    = vdupq_n_s8(1);
++
++    // one weight block -> four 16-weight int8 groups (same integer values as the reference)
++    #define S7_DEQ(QS, Q0, Q1, Q2, Q3) do { \
++        const uint8x16_t bits_ = vld1q_u8(QS); \
++        Q0 = vqtbl1q_u8(bits_, sh0); Q1 = vqtbl1q_u8(bits_, sh1); \
++        Q2 = vqtbl1q_u8(bits_, sh2); Q3 = vqtbl1q_u8(bits_, sh3); \
++        Q0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshlq_u8(Q0, shifts), mask2)), one); \
++        Q1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshlq_u8(Q1, shifts), mask2)), one); \
++        Q2 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshlq_u8(Q2, shifts), mask2)), one); \
++        Q3 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshlq_u8(Q3, shifts), mask2)), one); \
++    } while (0)
++
++    // 32-weight group partial, kept as a 4-lane vector: the q2_0 reference accumulates
++    // vcvtq_f32_s32(vector) with one vmlaq_n_f32 per group (no horizontal add until the end),
++    // and reproducing that order is what makes this kernel bit-exact.
++    #define S7_GROUP(QA, QB, YL, YH) \
++        ggml_vdotq_s32(ggml_vdotq_s32(vdupq_n_s32(0), QA, YL), QB, YH)
++
++    // One weight block, all four token columns. Unpacking here (rather than unpairing both
++    // blocks of a pair up front) keeps only four qx registers live alongside the eight
++    // accumulators, which is what removes the folded stack spills.
++    #define S7_TOK4_BLOCK(BLK, ACC0, ACC1, ACC2, ACC3) do { \
++        int8x16_t q0_, q1_, q2_, q3_; \
++        S7_DEQ(x[BLK].qs, q0_, q1_, q2_, q3_); \
++        const float dd_ = GGML_CPU_FP16_TO_FP32(x[BLK].d); \
++        { const block_q8_0 * y_ = (const block_q8_0 *) vy0 + 2 * (BLK); \
++          const float s0_ = dd_ * GGML_CPU_FP16_TO_FP32(y_[0].d); \
++          const float s1_ = dd_ * GGML_CPU_FP16_TO_FP32(y_[1].d); \
++          (ACC0) = vmlaq_n_f32((ACC0), vcvtq_f32_s32(S7_GROUP(q0_, q1_, vld1q_s8(y_[0].qs), vld1q_s8(y_[0].qs + 16))), s0_); \
++          (ACC0) = vmlaq_n_f32((ACC0), vcvtq_f32_s32(S7_GROUP(q2_, q3_, vld1q_s8(y_[1].qs), vld1q_s8(y_[1].qs + 16))), s1_); } \
++        { const block_q8_0 * y_ = (const block_q8_0 *) vy1 + 2 * (BLK); \
++          const float s0_ = dd_ * GGML_CPU_FP16_TO_FP32(y_[0].d); \
++          const float s1_ = dd_ * GGML_CPU_FP16_TO_FP32(y_[1].d); \
++          (ACC1) = vmlaq_n_f32((ACC1), vcvtq_f32_s32(S7_GROUP(q0_, q1_, vld1q_s8(y_[0].qs), vld1q_s8(y_[0].qs + 16))), s0_); \
++          (ACC1) = vmlaq_n_f32((ACC1), vcvtq_f32_s32(S7_GROUP(q2_, q3_, vld1q_s8(y_[1].qs), vld1q_s8(y_[1].qs + 16))), s1_); } \
++        { const block_q8_0 * y_ = (const block_q8_0 *) vy2 + 2 * (BLK); \
++          const float s0_ = dd_ * GGML_CPU_FP16_TO_FP32(y_[0].d); \
++          const float s1_ = dd_ * GGML_CPU_FP16_TO_FP32(y_[1].d); \
++          (ACC2) = vmlaq_n_f32((ACC2), vcvtq_f32_s32(S7_GROUP(q0_, q1_, vld1q_s8(y_[0].qs), vld1q_s8(y_[0].qs + 16))), s0_); \
++          (ACC2) = vmlaq_n_f32((ACC2), vcvtq_f32_s32(S7_GROUP(q2_, q3_, vld1q_s8(y_[1].qs), vld1q_s8(y_[1].qs + 16))), s1_); } \
++        { const block_q8_0 * y_ = (const block_q8_0 *) vy3 + 2 * (BLK); \
++          const float s0_ = dd_ * GGML_CPU_FP16_TO_FP32(y_[0].d); \
++          const float s1_ = dd_ * GGML_CPU_FP16_TO_FP32(y_[1].d); \
++          (ACC3) = vmlaq_n_f32((ACC3), vcvtq_f32_s32(S7_GROUP(q0_, q1_, vld1q_s8(y_[0].qs), vld1q_s8(y_[0].qs + 16))), s0_); \
++          (ACC3) = vmlaq_n_f32((ACC3), vcvtq_f32_s32(S7_GROUP(q2_, q3_, vld1q_s8(y_[1].qs), vld1q_s8(y_[1].qs + 16))), s1_); } \
++    } while (0)
++
++    for (int ix = 0; ix < 4; ++ix) {
++        const block_q2_0 * GGML_RESTRICT x = (const block_q2_0 *) ((const uint8_t *) vx + (size_t) ix * bx);
++
++        float32x4_t e0 = vdupq_n_f32(0.0f), e1 = vdupq_n_f32(0.0f);
++        float32x4_t e2 = vdupq_n_f32(0.0f), e3 = vdupq_n_f32(0.0f);
++        float32x4_t o0 = vdupq_n_f32(0.0f), o1 = vdupq_n_f32(0.0f);
++        float32x4_t o2 = vdupq_n_f32(0.0f), o3 = vdupq_n_f32(0.0f);
++
++        int i = 0;
++        for (; i + 1 < nb; i += 2) {
++            S7_TOK4_BLOCK(i,     e0, e1, e2, e3);
++            S7_TOK4_BLOCK(i + 1, o0, o1, o2, o3);
++        }
++        if (i < nb) {
++            S7_TOK4_BLOCK(i, e0, e1, e2, e3);
++        }
++
++        s0[ix] = vaddvq_f32(vaddq_f32(e0, o0));
++        s1[ix] = vaddvq_f32(vaddq_f32(e1, o1));
++        s2[ix] = vaddvq_f32(vaddq_f32(e2, o2));
++        s3[ix] = vaddvq_f32(vaddq_f32(e3, o3));
++    }
++
++    #undef S7_DEQ
++    #undef S7_GROUP
++    #undef S7_TOK4_BLOCK
++    return 1;
++}
 diff --git a/ggml/src/ggml-cpu/arch/arm/quants.c b/ggml/src/ggml-cpu/arch/arm/quants.c
 index cfbbf66..a120bb5 100644
 --- a/ggml/src/ggml-cpu/arch/arm/quants.c
@@ -122,8 +1147,70 @@ index cfbbf66..a120bb5 100644
  #else
      ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
      return;
+diff --git a/ggml/src/ggml-cpu/ggml-cpu-impl.h b/ggml/src/ggml-cpu/ggml-cpu-impl.h
+index 82345b2..b13b58d 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu-impl.h
++++ b/ggml/src/ggml-cpu/ggml-cpu-impl.h
+@@ -533,6 +533,57 @@ void ggml_barrier(struct ggml_threadpool * tp);
+ void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value);
+ int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value);
+ 
++#if defined(__aarch64__) && defined(__ARM_NEON)
++// BONSAI_MOE_X4 (arch/arm/iqk_x4.c): 0 off, 1 bit-exact, 2 packed accumulate, 3 bit-exact
++// two-row variant of 1 with no stack spills
++int  bonsai_q2_0_x4_mode(void);
++void bonsai_vec_dot_q2_0_q8_0_x4(int n, float * s, const void * vx, size_t bx,
++                                 const void * vy, int mode);
++// BONSAI_Q3K_X4 (arch/arm/iqk_x4.c): bit-exact four-row q3_K, q8_K load shared
++int  bonsai_q3_K_x4_mode(void);
++void bonsai_vec_dot_q3_K_q8_K_x4(int n, float * s, const void * vx, size_t bx,
++                                 const void * vy, int mode);
++// BONSAI_MOE_X4_PREFILL (arch/arm/iqk_x4.c): bit-exact 4-row x 2-token q2_0 tile. The two
++// activation rows and the two result vectors are independent pointers, because an expert's
++// rows are permuted by the router and adjacent rows are not a fixed byte stride apart.
++int  bonsai_q2_0_x4_prefill_mode(void);
++int  bonsai_vec_dot_q2_0_q8_0_x4t4(int n,
++                                   float * s0, float * s1, float * s2, float * s3,
++                                   const void * vx, size_t bx,
++                                   const void * vy0, const void * vy1,
++                                   const void * vy2, const void * vy3);
++int  bonsai_vec_dot_q2_0_q8_0_x4t2(int n, float * s0, float * s1, const void * vx, size_t bx,
++                                   const void * vy0, const void * vy1);
++
++// BONSAI_Q8_0_X4 (arch/arm/iqk_x4.c): repack an activation row into contiguous 16-byte-aligned
++// records once per 16-row weight block, then run the row-pair kernel over the packed row.
++// The values are copied, not recomputed, so the result is bit-identical.
++#define BONSAI_Q8_0_X4_MAX_BYTES 8192
++int  bonsai_q8_0_x4_mode(void);
++int  bonsai_q8_0_x4_bytes(int n);                       // 0 if n cannot be packed in the buffer
++void bonsai_pack_q8_0_x4(int n, void * dst, const void * src);
++void bonsai_vec_dot_q2_0_q8_0_x4_packed(int n, float * s, const void * vx, size_t bx,
++                                        const void * vy_packed);
++// BONSAI_Q8_0_X4=2: the four-row decode kernel (MOE_X4=1 order) over a packed activation row
++void bonsai_vec_dot_q2_0_q8_0_x4_packed4(int n, float * s, const void * vx, size_t bx,
++                                         const void * vy_packed);
++int  bonsai_q2_0_x4_prefill_packed_mode(void);
++int  bonsai_vec_dot_q2_0_q8_0_x4t2_packed(int n, float * s0, float * s1, const void * vx, size_t bx,
++                                          const void * vy0, const void * vy1);
++// coverage counters: a bit-identity gate is vacuous unless the new path actually ran. The tests and
++// the harness read these instead of assuming the branch was taken.
++long bonsai_q8_0_x4_packs(void);
++long bonsai_pk_hits(void);
++void bonsai_pk_invalidate(void);
++const void * bonsai_pk_probe(const void * row, int n, int slot);
++const void * bonsai_pk_probe_tag(const void * row, int n, int slot, int tag);
++long bonsai_pk_hits_tag(int t);
++long bonsai_pk_misses_tag(int t);
++long bonsai_pk_misses(void);
++#endif
++
++long bonsai_q2_0_x4_prefill_t2_calls(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 5428d51..601396f 100644
+index 5428d51..609f8a1 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
 @@ -20,6 +20,7 @@
@@ -134,7 +1221,610 @@ index 5428d51..601396f 100644
  #endif
  
  #include <assert.h>
-@@ -1551,6 +1552,91 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
+@@ -1162,6 +1163,180 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2,
+ 
+ // ggml_compute_forward_mul_mat
+ 
++// Streaming prefetch for the flat single-token path; no-op off GCC/clang.
++static inline void mulmat_flat_prefetch(const void * p) {
++#if defined(__GNUC__) || defined(__clang__)
++    __builtin_prefetch(p, 0, 0);
++#else
++    (void) p;
++#endif
++}
++
++// BONSAI_MOE_X4_PREFILL call counter. A bit-identity comparison against the stock path is
++// vacuous unless the paired path actually ran, so the verifier reads this counter instead of
++// trusting that the branch was taken.
++static atomic_long g_prefill_t2_calls;
++long bonsai_q2_0_x4_prefill_t2_calls(void) { return (long) atomic_load(&g_prefill_t2_calls); }
++
++#if defined(__aarch64__) && defined(__ARM_NEON)
++// BONSAI_Q8_0_X4 scratch: one packed activation row per worker thread. Per thread rather than
++// per stack frame so the 8 KB is paid once instead of on every one_chunk call, and 16-byte
++// aligned so every record load in the kernel is aligned.
++static _Thread_local uint8_t g_q8_0_x4_buf[BONSAI_Q8_0_X4_MAX_BYTES] __attribute__((aligned(16)));
++static atomic_long g_q8_0_x4_packs;
++long bonsai_q8_0_x4_packs(void) { return (long) atomic_load(&g_q8_0_x4_packs); }
++
++// Two-entry per-thread packed-row cache for the prefill tile. mul_mat_id_one_chunk / mul_mat_one_chunk
++// are called once per 16-row block, and with n_ff = 512 the SAME activation row serves 32 consecutive
++// blocks of the same expert, so caching the pack by (row pointer, n) turns 32 packs into one. That is
++// what makes packing free instead of the +26% activation traffic Stage 7 measured, and it is why the
++// repack is re-tested here on the tile that actually wins rather than on the row-pair kernel.
++#define BONSAI_PK_SLOTS 2
++static _Thread_local uint8_t g_pk_buf[BONSAI_PK_SLOTS][BONSAI_Q8_0_X4_MAX_BYTES] __attribute__((aligned(16)));
++static _Thread_local const void * g_pk_src[BONSAI_PK_SLOTS];
++static _Thread_local int g_pk_n[BONSAI_PK_SLOTS];
++static atomic_long g_pk_hits, g_pk_misses;
++// Per-op-class counters so a test can prove that BOTH nodes reached the cache. Without this, a
++// two-node test that only exercised one node would pass vacuously - the exact trap the first
++// Level 2 test fell into.
++//   tag 0 = GGML_OP_MUL_MAT     (dense path)
++//   tag 1 = GGML_OP_MUL_MAT_ID  (expert path)
++static atomic_long g_pk_hits_tag[2], g_pk_misses_tag[2];
++static atomic_long g_pk_graphs;      /* graphs completed, for the periodic report */
++static int g_pk_every = -1;          /* 0 disables everything after the first line */
++static int g_pk_first = 1;           /* the very first graph: no arm can be shorter than that */
++long bonsai_pk_hits_tag(int t)   { return (t >= 0 && t < 2) ? (long) atomic_load(&g_pk_hits_tag[t])   : -1; }
++long bonsai_pk_misses_tag(int t) { return (t >= 0 && t < 2) ? (long) atomic_load(&g_pk_misses_tag[t]) : -1; }
++// one-time read of the two packed switches; both default off, so the per-node hook is a load+branch
++static int g_pk_on = -1;
++static void bonsai_pk_report_once(void);
++long bonsai_pk_hits(void)   { return (long) atomic_load(&g_pk_hits); }
++long bonsai_pk_misses(void) { return (long) atomic_load(&g_pk_misses); }
++
++// Per-thread node generation. Incremented once per graph node by the owning worker, and part of the
++// cache key.
++//
++// WHY THIS EXISTS (Stage 9 correctness fix, found by audit): params->wdata is ONE scratch buffer that
++// every MUL_MAT / MUL_MAT_ID node re-quantises its own src1 into, at offset 0. So the activation row of
++// layer 1's `up_exps` lands at the exact same address that layer 0's `up_exps` used, and the same holds
++// across tokens. Keying the cache on (pointer, n) alone therefore produced a FALSE HIT and silently
++// reused the previous layer's - or previous token's - packed activation. The generation makes the key
++// (pointer, n, node generation): inside one node wdata is immutable during COMPUTE, so all of that
++// node's 16-row chunks still hit, and the first chunk of the next node necessarily misses.
++static _Thread_local uint64_t g_pk_gen;
++static _Thread_local uint64_t g_pk_ent_gen[BONSAI_PK_SLOTS];
++
++void bonsai_pk_invalidate(void) {
++    g_pk_gen++;
++}
++
++// Test-only switch (default is the shipped, correct behaviour):
++//   BONSAI_PK_INVALIDATE=node   invalidate once per node per worker  (default)
++//   BONSAI_PK_INVALIDATE=graph  invalidate once per graph            (the weaker fix, for the
++//                                                                     discriminating host test)
++static int bonsai_pk_inval_mode(void) {
++    static int m = -1;
++    if (m < 0) {
++        const char * e = getenv("BONSAI_PK_INVALIDATE");
++        m = (e && strcmp(e, "graph") == 0) ? 1 : 0;
++    }
++    return m;
++}
++
++static int bonsai_pk_enabled(void) {
++    if (g_pk_on < 0) {
++        g_pk_on = (bonsai_q8_0_x4_mode() >= 2 || bonsai_q2_0_x4_prefill_packed_mode()) ? 1 : 0;
++    }
++    return g_pk_on;
++}
++
++static const void * bonsai_pk_cached_tag(const void * row, int n, int slot, int tag) {
++    bonsai_pk_report_once();
++    if (tag < 0 || tag > 1) tag = 0;
++    if (slot >= 0 && slot < BONSAI_PK_SLOTS &&
++        g_pk_ent_gen[slot] == g_pk_gen && g_pk_n[slot] == n && g_pk_src[slot] == row) {
++        atomic_fetch_add(&g_pk_hits, 1);
++        atomic_fetch_add(&g_pk_hits_tag[tag], 1);
++        return g_pk_buf[slot];
++    }
++    bonsai_pack_q8_0_x4(n, g_pk_buf[slot], row);
++    g_pk_src[slot]     = row;
++    g_pk_n[slot]       = n;
++    g_pk_ent_gen[slot] = g_pk_gen;
++    atomic_fetch_add(&g_pk_misses, 1);
++    atomic_fetch_add(&g_pk_misses_tag[tag], 1);
++    return g_pk_buf[slot];
++}
++
++static const void * bonsai_pk_cached(const void * row, int n, int slot) {
++    return bonsai_pk_cached_tag(row, n, slot, 0);
++}
++
++// BONSAI_PK_REPORT=1 prints the cache counters at process exit, so a device arm can prove that D1 /
++// C2 actually engaged instead of publishing a null result that was really a no-op. This exists
++// because a wrong guard already disabled D1 everywhere once, and only the host harness noticed
++// (every shape showed pk_hits=0); on the device nothing replays that counter.
++static void bonsai_pk_print(const char * why) {
++    fprintf(stderr, "BONSAI_PK why=%s graphs=%ld hits=%ld misses=%ld\n", why,
++            (long) atomic_load(&g_pk_graphs), (long) atomic_load(&g_pk_hits),
++            (long) atomic_load(&g_pk_misses));
++    fflush(stderr);
++}
++
++static void bonsai_pk_atexit(void) {
++    if (g_pk_on == 1) bonsai_pk_print("exit");
++}
++
++/* Periodic report, thread 0 only, designed so it costs almost nothing INSIDE the measured window.
++ *
++ * The atexit-only reporter made the evidence chain depend on a CLEAN shutdown: SIGKILL from a hung
++ * arm, a crashed server or a timeout skips atexit, leaves no counter line, and the analyzer marks a
++ * perfectly good packed arm INVALID. A periodic line fixes that, but stderr on Android is a pipe to
++ * adb and a blocking write during a measured request is not free even when it is 0.0004% of a step.
++ *
++ * So: ONE line at graph BONSAI_PK_FIRST (default 1 - the floor, since no arm can run fewer than one
++ * graph), then every BONSAI_PK_EVERY graphs (default 512), a handful of prints per arm rather than
++ * two dozen. Graph 1 always lands during warmup, well outside any measured window.
++ *
++ * The anchor is 1 rather than a small number like 16 because a 262-token prefill is ONE graph: an
++ * identity prefill arm is warmup (~9 graphs) plus the measured request, i.e. ~10-15 graphs total, so
++ * an anchor of 16 would sit above the whole arm and silently restore the shutdown dependency this
++ * mechanism exists to remove. The anchor is only useful at its floor. */
++static void bonsai_pk_maybe_report(void) {
++    if (g_pk_on != 1) return;
++    const long g = (long) atomic_fetch_add(&g_pk_graphs, 1) + 1;
++    if (g == g_pk_first) { bonsai_pk_print("periodic"); return; }
++    if (g_pk_every <= 0) return;
++    if (g % g_pk_every == 0) bonsai_pk_print("periodic");
++}
++
++static void bonsai_pk_report_once(void) {
++    static int done;
++    if (done) return;
++    done = 1;
++    if (getenv("BONSAI_PK_REPORT") && atoi(getenv("BONSAI_PK_REPORT")) > 0) {
++        const char * e = getenv("BONSAI_PK_EVERY");
++        const char * f = getenv("BONSAI_PK_FIRST");
++        g_pk_every = e ? atoi(e) : 512;
++        g_pk_first = f ? atoi(f) : 1;
++        atexit(bonsai_pk_atexit);
++    } else {
++        g_pk_every = 0;
++    }
++}
++
++// Test hook: go through the real cache exactly as the kernels do, so a host test can prove the
++// staleness behaviour without reaching into static state.
++const void * bonsai_pk_probe(const void * row, int n, int slot) {
++    return bonsai_pk_cached(row, n, slot);
++}
++
++// Same probe, but attributed to an op class so the two-node test can separate A from B.
++const void * bonsai_pk_probe_tag(const void * row, int n, int slot, int tag) {
++    return bonsai_pk_cached_tag(row, n, slot, tag);
++}
++#endif
++
+ static void ggml_compute_forward_mul_mat_one_chunk(
+     const struct ggml_compute_params * params,
+     struct ggml_tensor * dst,
+@@ -1170,7 +1345,8 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+     const int64_t ir0_start,
+     const int64_t ir0_end,
+     const int64_t ir1_start,
+-    const int64_t ir1_end) {
++    const int64_t ir1_end,
++    const bool flat_prefetch) {
+ 
+     const struct ggml_tensor * src0 = dst->src[0];
+     const struct ggml_tensor * src1 = dst->src[1];
+@@ -1208,10 +1384,77 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+     // attempt to reduce false-sharing (does not seem to make a difference)
+     // 16 * 2, accounting for mmla kernels
+     float tmp[32];
++#if defined(__aarch64__) && defined(__ARM_NEON)
++    float tmp_b[32];
++    // BONSAI_MOE_X4_PREFILL: two token columns per weight-row pass
++    const int prefill = (type == GGML_TYPE_Q2_0 && num_rows_per_vec_dot == 1) ? bonsai_q2_0_x4_prefill_mode() : 0;
++    const int pk2 = (type == GGML_TYPE_Q2_0) ? bonsai_q2_0_x4_prefill_packed_mode() : 0;
++#endif
+ 
+     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+-            for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += num_rows_per_vec_dot) {
++            int64_t ir1 = iir1;
++#if defined(__aarch64__) && defined(__ARM_NEON)
++            // Pairs of token columns: the weight block is expanded once for both tokens, which is
++            // the amortisation the stock token-outer loop cannot get. The two leftover cases (one
++            // token, or fewer than four weight rows) fall through to the loops below unchanged.
++            if (prefill && ir1 + 1 < iir1 + blck_1 && ir1 + 1 < ir1_end) {
++                for (; ir1 + 1 < iir1 + blck_1 && ir1 + 1 < ir1_end; ir1 += 2) {
++                    const int64_t a13 = ir1 / (ne12 * ne1);
++                    const int64_t a12 = (ir1 - a13 * ne12 * ne1) / ne1;
++                    const int64_t a11 = ir1 - a13 * ne12 * ne1 - a12 * ne1;
++                    const int64_t b13 = (ir1 + 1) / (ne12 * ne1);
++                    const int64_t b12 = (ir1 + 1 - b13 * ne12 * ne1) / ne1;
++                    const int64_t b11 = ir1 + 1 - b13 * ne12 * ne1 - b12 * ne1;
++
++                    const int64_t a02 = a12 / r2, a03 = a13 / r3;
++                    const int64_t b02 = b12 / r2, b03 = b13 / r3;
++                    const char * src0_row_0 = (const char*)src0->data + (0 + a02 * nb02 + a03 * nb03);
++                    const char * src0_row_1 = (const char*)src0->data + (0 + b02 * nb02 + b03 * nb03);
++
++                    const char * src1_col_0 = (const char*)wdata +
++                        (src1_cont || src1->type != vec_dot_type
++                            ? (a11 + a12 * ne11 + a13 * ne12 * ne11) * row_size
++                            : (a11 * nb11 + a12 * nb12 + a13 * nb13));
++                    const char * src1_col_1 = (const char*)wdata +
++                        (src1_cont || src1->type != vec_dot_type
++                            ? (b11 + b12 * ne11 + b13 * ne12 * ne11) * row_size
++                            : (b11 * nb11 + b12 * nb12 + b13 * nb13));
++                    float * dst_col_0 = (float*)((char*)dst->data + (a11 * nb1 + a12 * nb2 + a13 * nb3));
++                    float * dst_col_1 = (float*)((char*)dst->data + (b11 * nb1 + b12 * nb2 + b13 * nb3));
++
++                    const int64_t ir0_x4_end = MIN(iir0 + blck_0, ir0_end);
++                    int64_t ir0 = iir0;
++                    if (a02 == b02 && a03 == b03) {
++                        // BONSAI_MOE_X4_PREFILL_PACKED: the same tile over a cached packed activation
++                        const int pk_ok = pk2 && bonsai_q8_0_x4_bytes((int) ne00) > 0;
++                        if (pk_ok) {
++                            const void * p0 = bonsai_pk_cached(src1_col_0, (int) ne00, 0);
++                            const void * p1 = bonsai_pk_cached(src1_col_1, (int) ne00, 1);
++                            for (; ir0 + 4 <= ir0_x4_end; ir0 += 4) {
++                                bonsai_vec_dot_q2_0_q8_0_x4t2_packed((int) ne00, &tmp[ir0 - iir0],
++                                                                     &tmp_b[ir0 - iir0],
++                                                                     src0_row_0 + ir0*nb01, nb01, p0, p1);
++                                atomic_fetch_add(&g_prefill_t2_calls, 1);
++                            }
++                        } else {
++                            for (; ir0 + 4 <= ir0_x4_end; ir0 += 4) {
++                                bonsai_vec_dot_q2_0_q8_0_x4t2((int) ne00, &tmp[ir0 - iir0], &tmp_b[ir0 - iir0],
++                                                              src0_row_0 + ir0*nb01, nb01, src1_col_0, src1_col_1);
++                                atomic_fetch_add(&g_prefill_t2_calls, 1);
++                            }
++                        }
++                    }
++                    for (; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
++                        vec_dot(ne00, &tmp  [ir0 - iir0], 0, src0_row_0 + ir0*nb01, 0, src1_col_0, 0, 1);
++                        vec_dot(ne00, &tmp_b[ir0 - iir0], 0, src0_row_1 + ir0*nb01, 0, src1_col_1, 0, 1);
++                    }
++                    memcpy(&dst_col_0[iir0], tmp,   (MIN(iir0 + blck_0, ir0_end) - iir0)*sizeof(float));
++                    memcpy(&dst_col_1[iir0], tmp_b, (MIN(iir0 + blck_0, ir0_end) - iir0)*sizeof(float));
++                }
++            }
++#endif
++            for (; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += num_rows_per_vec_dot) {
+                 const int64_t i13 = (ir1 / (ne12 * ne1));
+                 const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
+                 const int64_t i11 = (ir1 - i13 * ne12 * ne1 - i12 * ne1);
+@@ -1240,7 +1483,45 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+                 //    vec_dot(ne00, &dst_col[ir0], src0_row + ir0*nb01, src1_col);
+                 //}
+ 
+-                for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
++                int64_t ir0 = iir0;
++#if defined(__aarch64__) && defined(__ARM_NEON)
++                // BONSAI_MOE_X4: four q2_0 rows per call, sharing one activation load
++                if (type == GGML_TYPE_Q2_0 && num_rows_per_vec_dot == 1) {
++                    const int x4 = bonsai_q2_0_x4_mode();
++                    // BONSAI_Q8_0_X4=2 (D1) also covers the dense single-token path
++                    const int q8m_d = bonsai_q8_0_x4_mode();
++                    if (q8m_d >= 2 && ne11 == 1 && bonsai_q8_0_x4_bytes((int) ne00) > 0) {
++                        const void * pky = bonsai_pk_cached_tag(src1_col, (int) ne00, 0, 0);  // D1, dense
++                        const int64_t d_end = MIN(iir0 + blck_0, ir0_end);
++                        for (; ir0 + 4 <= d_end; ir0 += 4) {
++                            bonsai_vec_dot_q2_0_q8_0_x4_packed4((int) ne00, &tmp[ir0 - iir0],
++                                                                src0_row + ir0*nb01, nb01, pky);
++                        }
++                    } else
++                    if (x4 > 0) {
++                        const int64_t ir0_x4_end = MIN(iir0 + blck_0, ir0_end);
++                        for (; ir0 + 4 <= ir0_x4_end; ir0 += 4) {
++                            bonsai_vec_dot_q2_0_q8_0_x4((int) ne00, &tmp[ir0 - iir0],
++                                                        src0_row + ir0*nb01, nb01, src1_col, x4);
++                        }
++                    }
++                }
++                // BONSAI_Q3K_X4: four q3_K rows per call, sharing the q8_K activation load
++                if (type == GGML_TYPE_Q3_K && num_rows_per_vec_dot == 1) {
++                    const int x4 = bonsai_q3_K_x4_mode();
++                    if (x4 > 0) {
++                        const int64_t ir0_x4_end = MIN(iir0 + blck_0, ir0_end);
++                        for (; ir0 + 4 <= ir0_x4_end; ir0 += 4) {
++                            bonsai_vec_dot_q3_K_q8_K_x4((int) ne00, &tmp[ir0 - iir0],
++                                                        src0_row + ir0*nb01, nb01, src1_col, x4);
++                        }
++                    }
++                }
++#endif
++                for (; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
++                    if (flat_prefetch && ((ir0 - iir0) & 7) == 0) {
++                        mulmat_flat_prefetch(src0_row + ir0 * nb01 + 4096);
++                    }
+                     vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
+                 }
+ 
+@@ -1252,6 +1533,45 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+     }
+ }
+ 
++// Dense single-token matmul with static contiguous row slices (BONSAI_MULMAT_FLAT).
++//
++// With one token nr1 == 1, so the stock path cuts ne01 into 64-row chunks that every thread
++// steals in turn and each thread jumps between slices. One contiguous slice per thread keeps
++// a single src0 stream per thread. Same rows, same vec_dot calls, same dst slots.
++//
++// Off by default: the Stage 1 mirrored A/B/B/A measured no resolvable win (point estimate
++// +1.7%, spread across pairs larger than the effect), so this stays opt-in.
++static atomic_long g_mulmat_flat_calls;
++static atomic_int  g_mulmat_flat_atexit;
++static int g_mulmat_flat_report = -1;
++
++static int mulmat_flat_reporting(void) {
++    if (g_mulmat_flat_report < 0) {
++        const char * r = getenv("BONSAI_MULMAT_FLAT_REPORT");
++        g_mulmat_flat_report = (r != NULL && atoi(r) != 0) ? 1 : 0;
++    }
++    return g_mulmat_flat_report;
++}
++
++static void mulmat_flat_report(void) {
++    fprintf(stderr, "BONSAI_MULMAT_FLAT: %ld flat mul_mat calls\n", atomic_load(&g_mulmat_flat_calls));
++}
++
++static int mulmat_flat_mode(void) {
++    static int mode = -1;
++    if (mode < 0) {
++        const char * e = getenv("BONSAI_MULMAT_FLAT");
++        mode = (e != NULL && atoi(e) != 0) ? 1 : 0;
++        if (mulmat_flat_reporting()) {
++            int expected = 0;
++            if (atomic_compare_exchange_strong(&g_mulmat_flat_atexit, &expected, 1)) {
++                atexit(mulmat_flat_report); // so a null A/B can be told apart from a dead path
++            }
++        }
++    }
++    return mode;
++}
++
+ void ggml_compute_forward_mul_mat(
+         const struct ggml_compute_params * params,
+               struct ggml_tensor * dst) {
+@@ -1407,6 +1727,27 @@ UseGgmlGemm1:;
+ UseGgmlGemm2:;
+ #endif
+ 
++    // single-token decode: one contiguous src0 row slice per thread instead of stolen chunks
++    if (mulmat_flat_mode() > 0 && !params->use_ref &&
++            ne11 == 1 && ne12 == 1 && ne13 == 1 && ne01 >= 64) {
++        const int64_t nrc = vec_dot_num_rows > 1 ? vec_dot_num_rows : 1;
++
++        int64_t per = (ne01 + nth - 1) / nth;
++        per = ((per + nrc - 1) / nrc) * nrc;
++
++        const int64_t ir0_start = ith * per;
++        const int64_t ir0_end   = MIN(ir0_start + per, ne01);
++
++        atomic_fetch_add(&g_mulmat_flat_calls, 1);
++        if (atomic_load(&g_mulmat_flat_calls) == 1 && mulmat_flat_reporting()) {
++            fprintf(stderr, "BONSAI_MULMAT_FLAT: flat path engaged\n");
++        }
++
++        // ne11 == 1 is odd, so the stock path also forces one row per vec_dot here
++        ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, 1, ir0_start, ir0_end, 0, 1, true);
++        return;
++    }
++
+     // This is the size of the first dimension of the result, so we can iterate that way. (see the ASSERT above, these are the same numbers)
+     const int64_t nr0 = ne0;
+ 
+@@ -1461,7 +1802,7 @@ UseGgmlGemm2:;
+         if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
+             num_rows_per_vec_dot = 1;
+         }
+-        ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
++        ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end, false);
+ 
+         if (nth >= nchunk0 * nchunk1) {
+             break;
+@@ -1480,6 +1821,27 @@ struct mmid_row_mapping {
+     int32_t i2;
+ };
+ 
++// BONSAI_MMID_BLK: weight rows per inner block in the EXPERT path only. It changes how many
++// rows share one activation load, not the arithmetic per row, so every value is bit-exact.
++// The dense mul_mat has its own blck_0 and is deliberately not wired to this variable.
++// Deployed cells: 16 (default), 64, 80, 108, 428 - the last two match ik's static
++// 6 chunks/expert at -t 6 rounded to multiples of 4 rows to keep the x4 tile aligned.
++// The per-block temporaries below are sized by this, so the cap and the arrays cannot drift.
++#define BONSAI_MMID_BLK_MAX 512
++
++static int64_t bonsai_mmid_blk(int64_t dflt) {
++    static int64_t v = -1;
++    if (v < 0) {
++        const char * e = getenv("BONSAI_MMID_BLK");
++        const int64_t m = e ? (int64_t) atoll(e) : 0;
++        v = (m >= 1 && m <= BONSAI_MMID_BLK_MAX) ? m : dflt;
++        if (getenv("BONSAI_MMID_BLK_DEBUG")) {
++            fprintf(stderr, "BONSAI_MMID_BLK rows_per_block=%lld\n", (long long) v);
++        }
++    }
++    return v;
++}
++
+ static void ggml_compute_forward_mul_mat_id_one_chunk(
+     struct ggml_tensor * dst,
+     const struct ggml_tensor * src0,
+@@ -1503,14 +1865,116 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
+     ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
+     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+ 
+-    const int64_t blck_0 = 16;
++    const int64_t blck_0 = bonsai_mmid_blk(16);
+     const int64_t blck_1 = 16;
+ 
+-    float tmp[16];
++    float tmp[BONSAI_MMID_BLK_MAX];
++#if defined(__aarch64__) && defined(__ARM_NEON)
++    float tmp_b[BONSAI_MMID_BLK_MAX], tmp_c[BONSAI_MMID_BLK_MAX], tmp_d[BONSAI_MMID_BLK_MAX];
++    // BONSAI_MOE_X4_PREFILL: two routed rows per weight-row pass
++    const int prefill = (type == GGML_TYPE_Q2_0) ? bonsai_q2_0_x4_prefill_mode() : 0;
++    const int pk2 = (type == GGML_TYPE_Q2_0) ? bonsai_q2_0_x4_prefill_packed_mode() : 0;
++#endif
+ 
+     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+-            for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ++ir1) {
++            int64_t ir1 = iir1;
++#if defined(__aarch64__) && defined(__ARM_NEON)
++            // BONSAI_MOE_X4_PREFILL=2 (Stage 8 candidate C1): four routed rows share one expansion
++            // of the weight block. This is the token-column axis, which is the axis ik amortises
++            // on (acc[nrc_y] in iqk's kernels): the accumulator count grows with the row count,
++            // but here each row owns exactly two accumulators and they are written out per row.
++            if (prefill > 1) {
++                for (; ir1 + 3 < iir1 + blck_1 && ir1 + 3 < ir1_end; ir1 += 4) {
++                    const struct mmid_row_mapping m0 = MMID_MATRIX_ROW(cur_a, ir1 + 0);
++                    const struct mmid_row_mapping m1 = MMID_MATRIX_ROW(cur_a, ir1 + 1);
++                    const struct mmid_row_mapping m2 = MMID_MATRIX_ROW(cur_a, ir1 + 2);
++                    const struct mmid_row_mapping m3 = MMID_MATRIX_ROW(cur_a, ir1 + 3);
++                    const char * c0 = (const char *) wdata + (src1_cont || src1->type != vec_dot_type
++                        ? ((m0.i1 % ne11) + m0.i2*ne11)*row_size : ((m0.i1 % ne11)*nb11 + m0.i2*nb12));
++                    const char * c1 = (const char *) wdata + (src1_cont || src1->type != vec_dot_type
++                        ? ((m1.i1 % ne11) + m1.i2*ne11)*row_size : ((m1.i1 % ne11)*nb11 + m1.i2*nb12));
++                    const char * c2 = (const char *) wdata + (src1_cont || src1->type != vec_dot_type
++                        ? ((m2.i1 % ne11) + m2.i2*ne11)*row_size : ((m2.i1 % ne11)*nb11 + m2.i2*nb12));
++                    const char * c3 = (const char *) wdata + (src1_cont || src1->type != vec_dot_type
++                        ? ((m3.i1 % ne11) + m3.i2*ne11)*row_size : ((m3.i1 % ne11)*nb11 + m3.i2*nb12));
++                    float * d0 = (float *) ((char *) dst->data + (m0.i1*nb1 + m0.i2*nb2));
++                    float * d1 = (float *) ((char *) dst->data + (m1.i1*nb1 + m1.i2*nb2));
++                    float * d2 = (float *) ((char *) dst->data + (m2.i1*nb1 + m2.i2*nb2));
++                    float * d3 = (float *) ((char *) dst->data + (m3.i1*nb1 + m3.i2*nb2));
++
++                    const int64_t ir0_t4_end = MIN(iir0 + blck_0, ir0_end);
++                    const int64_t nout = MIN(iir0 + blck_0, ir0_end) - iir0;
++                    int64_t ir0 = iir0;
++                    for (; ir0 + 4 <= ir0_t4_end; ir0 += 4) {
++                        const int64_t k = ir0 - iir0;
++                        bonsai_vec_dot_q2_0_q8_0_x4t4((int) ne00, &tmp[k], &tmp_b[k], &tmp_c[k], &tmp_d[k],
++                                                      src0_cur + ir0*nb01, nb01, c0, c1, c2, c3);
++                    }
++                    for (; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
++                        const int64_t k = ir0 - iir0;
++                        vec_dot(ne00, &tmp  [k], 0, src0_cur + ir0*nb01, 0, c0, 0, 1);
++                        vec_dot(ne00, &tmp_b[k], 0, src0_cur + ir0*nb01, 0, c1, 0, 1);
++                        vec_dot(ne00, &tmp_c[k], 0, src0_cur + ir0*nb01, 0, c2, 0, 1);
++                        vec_dot(ne00, &tmp_d[k], 0, src0_cur + ir0*nb01, 0, c3, 0, 1);
++                    }
++                    memcpy(&d0[iir0], tmp,   nout*sizeof(float));
++                    memcpy(&d1[iir0], tmp_b, nout*sizeof(float));
++                    memcpy(&d2[iir0], tmp_c, nout*sizeof(float));
++                    memcpy(&d3[iir0], tmp_d, nout*sizeof(float));
++                }
++            }
++            // Two routed rows share one expansion of the weight block. The rows are looked up
++            // through matrix_rows separately because an expert's rows are a permutation of the
++            // batch rows, so the two activation pointers are not a fixed stride apart and the two
++            // destination columns are permuted the same way.
++            if (prefill && ir1 + 1 < iir1 + blck_1 && ir1 + 1 < ir1_end) {
++                for (; ir1 + 1 < iir1 + blck_1 && ir1 + 1 < ir1_end; ir1 += 2) {
++                    const struct mmid_row_mapping map_a = MMID_MATRIX_ROW(cur_a, ir1);
++                    const struct mmid_row_mapping map_b = MMID_MATRIX_ROW(cur_a, ir1 + 1);
++                    const int64_t i11a = map_a.i1 % ne11, i12a = map_a.i2;
++                    const int64_t i11b = map_b.i1 % ne11, i12b = map_b.i2;
++
++                    const char * src1_col_0 = (const char *) wdata +
++                        (src1_cont || src1->type != vec_dot_type
++                            ? (i11a + i12a*ne11)*row_size
++                            : (i11a*nb11 + i12a*nb12));
++                    const char * src1_col_1 = (const char *) wdata +
++                        (src1_cont || src1->type != vec_dot_type
++                            ? (i11b + i12b*ne11)*row_size
++                            : (i11b*nb11 + i12b*nb12));
++                    float * dst_col_0 = (float *) ((char *) dst->data + (map_a.i1*nb1 + i12a*nb2));
++                    float * dst_col_1 = (float *) ((char *) dst->data + (map_b.i1*nb1 + i12b*nb2));
++
++                    const int64_t ir0_x4_end = MIN(iir0 + blck_0, ir0_end);
++                    int64_t ir0 = iir0;
++                    // BONSAI_MOE_X4_PREFILL_PACKED: same tile, activation read from the cached packed
++                    // row. This is the expert path, i.e. the 61.9% of prefill that the q2_0 gap lives in.
++                    if (pk2 && bonsai_q8_0_x4_bytes((int) ne00) > 0) {
++                        const void * p0 = bonsai_pk_cached_tag(src1_col_0, (int) ne00, 0, 1);
++                        const void * p1 = bonsai_pk_cached_tag(src1_col_1, (int) ne00, 1, 1);
++                        for (; ir0 + 4 <= ir0_x4_end; ir0 += 4) {
++                            bonsai_vec_dot_q2_0_q8_0_x4t2_packed((int) ne00, &tmp[ir0 - iir0],
++                                                                 &tmp_b[ir0 - iir0],
++                                                                 src0_cur + ir0*nb01, nb01, p0, p1);
++                            atomic_fetch_add(&g_prefill_t2_calls, 1);
++                        }
++                    } else
++                    for (; ir0 + 4 <= ir0_x4_end; ir0 += 4) {
++                        bonsai_vec_dot_q2_0_q8_0_x4t2((int) ne00, &tmp[ir0 - iir0], &tmp_b[ir0 - iir0],
++                                                      src0_cur + ir0*nb01, nb01, src1_col_0, src1_col_1);
++                        atomic_fetch_add(&g_prefill_t2_calls, 1);
++                    }
++                    for (; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
++                        vec_dot(ne00, &tmp  [ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col_0, 0, 1);
++                        vec_dot(ne00, &tmp_b[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col_1, 0, 1);
++                    }
++                    memcpy(&dst_col_0[iir0], tmp,   (MIN(iir0 + blck_0, ir0_end) - iir0)*sizeof(float));
++                    memcpy(&dst_col_1[iir0], tmp_b, (MIN(iir0 + blck_0, ir0_end) - iir0)*sizeof(float));
++                }
++            }
++#endif
++            for (; ir1 < iir1 + blck_1 && ir1 < ir1_end; ++ir1) {
+                 const int64_t _i12 = ir1; // logical row index for this expert
+ 
+                 struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, _i12);
+@@ -1533,7 +1997,53 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
+ 
+                 float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2));
+ 
+-                for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
++                int64_t ir0 = iir0;
++#if defined(__aarch64__) && defined(__ARM_NEON)
++                // BONSAI_MOE_X4: four q2_0 rows per call, sharing one activation load
++                if (type == GGML_TYPE_Q2_0) {
++                    const int x4 = bonsai_q2_0_x4_mode();
++                    // BONSAI_Q8_0_X4 (Stage 9, D1): the packed activation on the WINNING four-row
++                    // decode kernel. On a single-token step every routed expert of up/gate reads the
++                    // same 1 x n_embd activation row, so the cached pack is built once and then hit
++                    // by every thread and every weight-row chunk - which is what makes the pack free
++                    // here where Stage 7's once-per-16-rows version cost +26% traffic.
++                    // D1 (mode 2) is DECODE-ONLY by construction. In mul_mat_id the activation is
++                    // [n_embd, n_expert_used, n_tokens], so the TOKEN count is ne12 and ne11 is the
++                    // expert count - gating on ne11 here disabled D1 everywhere, which the qemu
++                    // harness caught immediately (all shapes showed pk_hits=0). ne12 == 1 is the
++                    // single-token condition, and it keeps D1 orthogonal to C2 (prefill-only).
++                    const int q8m = bonsai_q8_0_x4_mode();
++                    const int q8m_eff = (q8m >= 2 && ne12 > 1) ? 0 : q8m;
++                    const int pk_bytes = q8m_eff ? bonsai_q8_0_x4_bytes((int) ne00) : 0;
++                    if (pk_bytes > 0) {
++                        const void * pky;
++                        if (q8m_eff >= 2) {
++                            pky = bonsai_pk_cached_tag(src1_col, (int) ne00, 0, 1);   // D1, expert path
++                        } else {
++                            bonsai_pack_q8_0_x4((int) ne00, g_q8_0_x4_buf, src1_col);
++                            atomic_fetch_add(&g_q8_0_x4_packs, 1);
++                            pky = g_q8_0_x4_buf;
++                        }
++                        const int64_t ir0_pk_end = MIN(iir0 + blck_0, ir0_end);
++                        for (; ir0 + 4 <= ir0_pk_end; ir0 += 4) {
++                            if (q8m_eff >= 2) {
++                                bonsai_vec_dot_q2_0_q8_0_x4_packed4((int) ne00, &tmp[ir0 - iir0],
++                                                                    src0_cur + ir0*nb01, nb01, pky);
++                            } else {
++                                bonsai_vec_dot_q2_0_q8_0_x4_packed((int) ne00, &tmp[ir0 - iir0],
++                                                                   src0_cur + ir0*nb01, nb01, pky);
++                            }
++                        }
++                    } else if (x4 > 0) {
++                        const int64_t ir0_x4_end = MIN(iir0 + blck_0, ir0_end);
++                        for (; ir0 + 4 <= ir0_x4_end; ir0 += 4) {
++                            bonsai_vec_dot_q2_0_q8_0_x4((int) ne00, &tmp[ir0 - iir0],
++                                                        src0_cur + ir0*nb01, nb01, src1_col, x4);
++                        }
++                    }
++                }
++#endif
++                for (; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
+                     vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
+                 }
+ 
+@@ -1551,6 +2061,121 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
      return ptr;
  }
  
@@ -223,10 +1913,40 @@ index 5428d51..601396f 100644
 +    }
 +}
 +
++// Expert-parallel work distribution for single-token mul_mat_id (BONSAI_MULMATID_FLAT).
++//
++// With one token the stock path walks the experts in order and every thread steals 16-row
++// chunks inside the *same* expert, so all threads miss the same TLB entries. Flattening to
++// contiguous half-expert units claimed from one counter lets each thread stream a different
++// expert and generate its own walks. Same rows, same vec_dot, same dst slots.
++static int mulmatid_flat_mode(void) {
++    static int mode = -1;
++    if (mode < 0) {
++        // Default 2 as of the Stage 6 on-device shootout: mode 2 extends the single queue from
++        // single-token decode to prefill, is bit-identical to the stock path (verified on six
++        // synthetic shapes and by device token identity on a 262-token prefill), and measured
++        // +14.95% / +16.10% prefill in the two mirrored passes with no decode change.
++        // BONSAI_MULMATID_FLAT=0 restores the stock per-expert path entirely.
++        const char * e = getenv("BONSAI_MULMATID_FLAT");
++        mode = e ? atoi(e) : 2;
++    }
++    return mode;
++}
++
++// the tiled path needs >= 8 rows for an expert, and GGML_CPU_TILED_MM_FORCE can override that
++static bool mulmatid_tiled_forced(void) {
++    static int forced = -1;
++    if (forced < 0) {
++        const char * e = getenv("GGML_CPU_TILED_MM_FORCE");
++        forced = (e != NULL && atoi(e) == 1) ? 1 : 0;
++    }
++    return forced == 1;
++}
++
  static void ggml_compute_forward_mul_mat_id(
          const struct ggml_compute_params * params,
                struct ggml_tensor * dst) {
-@@ -1658,6 +1744,22 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1658,16 +2283,158 @@ static void ggml_compute_forward_mul_mat_id(
                  matrix_row_counts[i02] += 1;
              }
          }
@@ -246,10 +1966,149 @@ index 5428d51..601396f 100644
 +                }
 +            }
 +        }
++    }
++
++    // single-token expert-parallel path: one counter over the whole flat unit space
++    const int  flat_mode = mulmatid_flat_mode();
++    const bool flat_wanted = flat_mode > 0 && !params->use_ref && !mulmatid_tiled_forced();
++    const bool use_flat = flat_wanted && ids->ne[1] == 1;
++
++    // Prefill (ids->ne[1] > 1) can drain the same single counter, but only when the tiled
++    // path cannot claim any expert: tiling walks the experts in lockstep across threads, so
++    // reordering the expert visits to balance the queue would break its collective work.
++    // Q2_0, the type of every routed expert in this model, is not a tiled type, so the stock
++    // path is the one_chunk path for all of them and the outputs stay bit-identical.
++    bool use_flat_prefill = false;
++    if (flat_mode >= 2 && flat_wanted && ids->ne[1] > 1) {
++        use_flat_prefill = true;
++        for (int cur_a = 0; cur_a < n_as; ++cur_a) {
++            if (matrix_row_counts[cur_a] > 0 &&
++                ggml_compute_forward_mul_mat_id_tiled_eligible(src0, src1, matrix_row_counts[cur_a])) {
++                use_flat_prefill = false;
++                break;
++            }
++        }
      }
  
      // reset current_chunk
-@@ -1810,6 +1912,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+-    for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
+-        atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
+-        *current_chunk_ctr = nth;
++    if (use_flat || use_flat_prefill) {
++        if (ith == 0) {
++            *(atomic_int *)(atomic_current_chunk + 0) = 0;
++        }
++    } else {
++        for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
++            atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
++            *current_chunk_ctr = nth;
++        }
+     }
+ 
+     ggml_barrier(params->threadpool);
+ 
++    if (use_flat_prefill) {
++        // BONSAI_MULMATID_FLAT=2: one queue over (expert x row chunk) for prefill. The chunks
++        // per expert mirror ik_llama.cpp's GGML_EXPERT_CHUNKING (MAX(1, MIN(nth, ne01/32))),
++        // which keeps the unit index -> expert mapping constant-time with no prefix table.
++        const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
++        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
++
++        const int64_t nr0 = ne01;
++        int64_t cpe = nr0 / 32;
++        if (cpe < 1)   cpe = 1;
++        if (cpe > nth) cpe = nth;
++        const int64_t dr0 = (nr0 + cpe - 1) / cpe;
++        const int64_t n_units = cpe * n_as;
++
++        atomic_int * flat_ctr = (atomic_int *)(atomic_current_chunk + 0);
++
++        int64_t u;
++        while ((u = atomic_fetch_add_explicit(flat_ctr, 1, memory_order_relaxed)) < n_units) {
++            const int     cur_a = (int) (u / cpe);
++            const int64_t chunk = u % cpe;
++            const int64_t cne1  = matrix_row_counts[cur_a];
++
++            if (cne1 == 0) {
++                continue;
++            }
++
++            const int64_t ir0_start = chunk * dr0;
++            const int64_t ir0_end   = MIN(ir0_start + dr0, nr0);
++
++            if (ir0_start >= ir0_end) {
++                continue;
++            }
++
++            const char * src0_cur = (const char *) src0->data + cur_a * nb02;
++
++            ggml_compute_forward_mul_mat_id_one_chunk(
++                dst, src0, src1, ids, cur_a,
++                ir0_start, ir0_end, 0, cne1,
++                src0_cur, matrix_rows, row_size, src1_cont, wdata
++            );
++        }
++        return;
++    }
++
++    if (use_flat) {
++        // only experts with rows become units; an expert with >= 8 rows belongs to the tiled
++        // path, so fall through to the stock loop if any reaches that
++        int32_t flat_experts[256];
++        int n_flat = 0;
++        bool flat_ok = true;
++
++        for (int cur_a = 0; cur_a < n_as; ++cur_a) {
++            const int64_t cne1 = matrix_row_counts[cur_a];
++            if (cne1 == 0) {
++                continue;
++            }
++            if (cne1 >= 8 || n_flat == (int) (sizeof(flat_experts)/sizeof(flat_experts[0]))) {
++                flat_ok = false;
++                break;
++            }
++            flat_experts[n_flat++] = cur_a;
++        }
++
++        if (flat_ok && n_flat > 0) {
++            const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
++            const size_t row_size = ggml_row_size(vec_dot_type, ne10);
++
++            const int64_t nr0 = ne01;
++            const int units_per_expert = nr0 >= 2 ? 2 : 1;
++            const int64_t per = (nr0 + units_per_expert - 1) / units_per_expert;
++            const int n_units = units_per_expert * n_flat;
++
++            atomic_int * flat_ctr = (atomic_int *)(atomic_current_chunk + 0);
++
++            int64_t u;
++            while ((u = atomic_fetch_add_explicit(flat_ctr, 1, memory_order_relaxed)) < n_units) {
++                const int cur_a = flat_experts[u / units_per_expert];
++                const int half  = (int) (u % units_per_expert);
++
++                const int64_t ir0_start = half * per;
++                const int64_t ir0_end   = MIN(ir0_start + per, nr0);
++
++                if (ir0_start >= ir0_end) {
++                    continue;
++                }
++
++                const char * src0_cur = (const char *) src0->data + cur_a * nb02;
++
++                ggml_compute_forward_mul_mat_id_one_chunk(
++                    dst, src0, src1, ids, cur_a,
++                    ir0_start, ir0_end, 0, matrix_row_counts[cur_a],
++                    src0_cur, matrix_rows, row_size, src1_cont, wdata
++                );
++            }
++            return;
++        }
++    }
++
+     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+         const int64_t cne1 = matrix_row_counts[cur_a];
+ 
+@@ -1810,6 +2577,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
              {
                  ggml_compute_forward_sum_rows(params, tensor);
              } break;
@@ -260,7 +2119,7 @@ index 5428d51..601396f 100644
          case GGML_OP_CUMSUM:
              {
                  ggml_compute_forward_cumsum(params, tensor);
-@@ -2282,6 +2388,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+@@ -2282,6 +3053,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
              {
                  n_tasks = 1;
              } break;
@@ -271,7 +2130,7 @@ index 5428d51..601396f 100644
          case GGML_OP_COUNT_EQUAL:
          case GGML_OP_SOLVE_TRI:
          case GGML_OP_GATED_DELTA_NET:
-@@ -3098,6 +3208,39 @@ static int ggml_cpu_try_fuse_ops(
+@@ -3098,6 +3873,168 @@ static int ggml_cpu_try_fuse_ops(
      return 0;
  }
  
@@ -284,13 +2143,79 @@ index 5428d51..601396f 100644
 +static uint64_t g_prof_op_ns[GGML_OP_COUNT];
 +static uint64_t g_prof_op_calls[GGML_OP_COUNT];
 +static uint64_t g_prof_type_ns[GGML_TYPE_COUNT];
++static uint64_t g_prof_type_calls[GGML_TYPE_COUNT];
++static uint64_t g_prof_type_bytes[GGML_TYPE_COUNT];
++static uint64_t g_prof_type_calls_mm[GGML_TYPE_COUNT];   /* MUL_MAT only */
++static uint64_t g_prof_type_calls_mmid[GGML_TYPE_COUNT]; /* MUL_MAT_ID only */
 +static uint64_t g_prof_graphs;
++
++// Per-weight breakdown for the matmul and embedding ops. The op and type tables cannot
++// separate output.weight from the other Q5_K tensors, nor one BF16 tensor from another, and
++// those are exactly the splits the dense budget needs.
++//
++// The table must hold every distinct src[0] seen: the LM head is the last matmul of a graph,
++// so an overflow silently drops it and undercounts the dense aggregates. 1024 was not enough
++// once GET_ROWS was included.
++#define BONSAI_PROF_MAX_W 4096
++static const struct ggml_tensor * g_prof_w     [BONSAI_PROF_MAX_W];
++static uint64_t                   g_prof_w_ns  [BONSAI_PROF_MAX_W];
++static uint64_t                   g_prof_w_call[BONSAI_PROF_MAX_W];
++static uint64_t                   g_prof_w_by  [BONSAI_PROF_MAX_W];
++static int                        g_prof_w_n;
++static bool                       g_prof_w_full;
++
++static int g_prof_w_find(const struct ggml_tensor * t) {
++    for (int i = 0; i < g_prof_w_n; ++i) {
++        if (g_prof_w[i] == t) {
++            return i;
++        }
++    }
++    if (g_prof_w_n >= BONSAI_PROF_MAX_W) {
++        if (!g_prof_w_full) {
++            g_prof_w_full = true;
++            fprintf(stderr, "BONSAI_PROF: weight table full at %d, per-weight numbers are now incomplete\n",
++                    BONSAI_PROF_MAX_W);
++        }
++        return -1;
++    }
++    g_prof_w[g_prof_w_n] = t;
++    return g_prof_w_n++;
++}
++
 +static inline uint64_t g_prof_now(void) {
 +    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
 +    return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
 +}
++
++// page-fault counters for this process, so a per-graph op time can be regressed against the
++// faults that graph took instead of assuming a cost per fault
++static void g_prof_faults(uint64_t * minf, uint64_t * majf) {
++    *minf = 0;
++    *majf = 0;
++    FILE * f = fopen("/proc/self/stat", "r");
++    if (!f) return;
++    char buf[4096];
++    const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
++    fclose(f);
++    buf[n] = 0;
++    const char * p = strrchr(buf, ')');
++    if (!p) return;
++    p++;
++    // after the comm field: state(3) ppid(4) pgrp(5) session(6) tty(7) tpgid(8) flags(9)
++    // minflt(10) cminflt(11) majflt(12)
++    unsigned long long a1,a2,a3,a4,a5,a6,mn,cm,mj;
++    if (sscanf(p, " %*c %llu %llu %llu %llu %llu %llu %llu %llu %llu",
++               &a1,&a2,&a3,&a4,&a5,&a6,&mn,&cm,&mj) == 9) {
++        *minf = mn;
++        *majf = mj;
++    }
++}
++
 +static void g_prof_dump(void) {
-+    fprintf(stderr, "\n=== CPU OP PROFILE after %llu graphs ===\n", (unsigned long long) g_prof_graphs);
++    uint64_t mn, mj;
++    g_prof_faults(&mn, &mj);
++    fprintf(stderr, "\n=== CPU OP PROFILE after %llu graphs minflt=%llu majflt=%llu ===\n",
++        (unsigned long long) g_prof_graphs, (unsigned long long) mn, (unsigned long long) mj);
 +    for (int op = 0; op < GGML_OP_COUNT; ++op) {
 +        if (!g_prof_op_calls[op]) continue;
 +        fprintf(stderr, "  %-22s %9.2f ms total %8.3f ms/graph %9llu calls\n",
@@ -300,9 +2225,72 @@ index 5428d51..601396f 100644
 +    }
 +    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
 +        if (!g_prof_type_ns[t]) continue;
-+        fprintf(stderr, "  MATMUL %-14s %9.2f ms total %8.3f ms/graph\n",
++        fprintf(stderr, "  MATMUL %-14s %9.2f ms total %8.3f ms/graph %9llu calls "
++                        "(mm=%llu mmid=%llu) %12llu bytes\n",
 +            ggml_type_name((enum ggml_type) t),
-+            g_prof_type_ns[t] / 1e6, g_prof_type_ns[t] / 1e6 / (double) g_prof_graphs);
++            g_prof_type_ns[t] / 1e6, g_prof_type_ns[t] / 1e6 / (double) g_prof_graphs,
++            (unsigned long long) g_prof_type_calls[t],
++            (unsigned long long) g_prof_type_calls_mm[t],
++            (unsigned long long) g_prof_type_calls_mmid[t],
++            (unsigned long long) g_prof_type_bytes[t]);
++    }
++    if (g_prof_w_n > 0) {
++        // aggregate every tracked weight, so the byte and bandwidth totals do not depend
++        // on the top-30 list below
++        uint64_t dn = 0, db = 0, dc = 0, en = 0, eb = 0, ec = 0;
++        for (int i = 0; i < g_prof_w_n; ++i) {
++            if (strstr(g_prof_w[i]->name, "_exps.")) {
++                en += g_prof_w_ns[i]; eb += g_prof_w_by[i]; ec += g_prof_w_call[i];
++            } else {
++                dn += g_prof_w_ns[i]; db += g_prof_w_by[i]; dc += g_prof_w_call[i];
++            }
++        }
++        const double dms = dn / 1e6, ems = en / 1e6;
++        fprintf(stderr, "  AGG dense  %10.2f ms tot %8.3f ms/graph %7llu calls %9.1f MiB %7.1f GiB/s\n",
++            dms, dms / (double) g_prof_graphs, (unsigned long long) dc, db / 1048576.0,
++            dms > 0.0 ? (db / 1073741824.0) / (dms / 1000.0) : 0.0);
++        fprintf(stderr, "  AGG expert %10.2f ms tot %8.3f ms/graph %7llu calls %9.1f MiB %7.1f GiB/s\n",
++            ems, ems / (double) g_prof_graphs, (unsigned long long) ec, eb / 1048576.0,
++            ems > 0.0 ? (eb / 1073741824.0) / (ems / 1000.0) : 0.0);
++
++        static bool used[BONSAI_PROF_MAX_W];
++        memset(used, 0, sizeof(used));
++        fprintf(stderr, "  --- top weights (cumulative) ---\n");
++        for (int k = 0; k < 30; ++k) {
++            int best = -1;
++            for (int i = 0; i < g_prof_w_n; ++i) {
++                if (used[i]) continue;
++                if (best < 0 || g_prof_w_ns[i] > g_prof_w_ns[best]) best = i;
++            }
++            if (best < 0 || g_prof_w_ns[best] == 0) break;
++            used[best] = true;
++            const double ms  = g_prof_w_ns[best] / 1e6;
++            const double mib = g_prof_w_by[best] / 1048576.0;
++            fprintf(stderr, "  W %-32s %9.2f ms tot %8.3f ms/graph %7llu calls %9.1f MiB %7.1f GiB/s\n",
++                g_prof_w[best]->name, ms, ms / (double) g_prof_graphs,
++                (unsigned long long) g_prof_w_call[best], mib,
++                ms > 0.0 ? (mib / 1024.0) / (ms / 1000.0) : 0.0);
++        }
++        // the 144 expert tensors crowd the list above, so the dense backbone and the
++        // embedding tables (GET_ROWS) need their own selection to be visible at all
++        memset(used, 0, sizeof(used));
++        fprintf(stderr, "  --- top dense weights (cumulative) ---\n");
++        for (int k = 0; k < 16; ++k) {
++            int best = -1;
++            for (int i = 0; i < g_prof_w_n; ++i) {
++                if (used[i]) continue;
++                if (strstr(g_prof_w[i]->name, "_exps.")) continue;
++                if (best < 0 || g_prof_w_ns[i] > g_prof_w_ns[best]) best = i;
++            }
++            if (best < 0 || g_prof_w_ns[best] == 0) break;
++            used[best] = true;
++            const double ms  = g_prof_w_ns[best] / 1e6;
++            const double mib = g_prof_w_by[best] / 1048576.0;
++            fprintf(stderr, "  D %-32s %9.2f ms tot %8.3f ms/graph %7llu calls %9.1f MiB %7.1f GiB/s\n",
++                g_prof_w[best]->name, ms, ms / (double) g_prof_graphs,
++                (unsigned long long) g_prof_w_call[best], mib,
++                ms > 0.0 ? (mib / 1024.0) / (ms / 1000.0) : 0.0);
++        }
 +    }
 +    fflush(stderr);
 +}
@@ -311,17 +2299,39 @@ index 5428d51..601396f 100644
  static thread_ret_t ggml_graph_compute_thread(void * data) {
      struct ggml_compute_state * state = (struct ggml_compute_state *) data;
      struct ggml_threadpool    * tp    = state->threadpool;
-@@ -3138,6 +3281,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3126,6 +4063,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
+ #endif
+ 
++    // BONSAI_PK_INVALIDATE=graph: the weaker, test-only variant - one invalidation per graph.
++    // The PK cache machinery is aarch64-only, so the hook is too.
++#if defined(__aarch64__) && defined(__ARM_NEON)
++    if (bonsai_pk_inval_mode() == 1) bonsai_pk_invalidate();
++
++    if (state->ith == 0 && bonsai_pk_enabled()) bonsai_pk_maybe_report();
++#endif
++
+     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
+         struct ggml_tensor * node = cgraph->nodes[node_n];
+ 
+@@ -3138,6 +4083,16 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
              continue;
          }
  
++#if defined(__aarch64__) && defined(__ARM_NEON)
++        // Every node re-quantises its own src1 into the shared params->wdata, so each worker drops its
++        // own cached packed rows here, once per node. Two stores per node per thread; without it D1 and
++        // C2 would read the previous node's activations (see the comment on g_pk_gen).
++        if (bonsai_pk_enabled() && bonsai_pk_inval_mode() == 0) bonsai_pk_invalidate();
++#endif
++
 +#if BONSAI_PROF
 +        const uint64_t prof_t0 = (state->ith == 0) ? g_prof_now() : 0;
 +#endif
          // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
          // Try fused ops, fall back to normal compute
          const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
-@@ -3156,8 +3302,43 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3156,8 +4111,84 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
          if (node_n + 1 < cgraph->n_nodes) {
              ggml_barrier(state->threadpool);
          }
@@ -330,10 +2340,51 @@ index 5428d51..601396f 100644
 +            const uint64_t prof_dt = g_prof_now() - prof_t0;
 +            g_prof_op_ns[node->op] += prof_dt;
 +            g_prof_op_calls[node->op] += 1;
++            // MUL_MAT / MUL_MAT_ID only. GET_ROWS was included here until Stage 9 and it made
++            // the per-type table wrong: on qwen4exp the f32 GET_ROWS gathers (174/token, 5.87 ms)
++            // were reported as "MATMUL f32 184 calls", i.e. the SAME time as the GET_ROWS op row
++            // counted a second time, and the graph in fact contains zero f32 MUL_MAT nodes.
 +            if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
-+                const enum ggml_type tt = node->src[0]->type;
++                const struct ggml_tensor * w  = node->src[0];
++                const enum ggml_type tt = w->type;
 +                if ((int) tt >= 0 && (int) tt < GGML_TYPE_COUNT) {
 +                    g_prof_type_ns[tt] += prof_dt;
++                    // per-type COUNTS (split by op) and the weight BYTES touched, so every row of
++                    // the decomposition gets a mechanical verdict instead of an argued one:
++                    //   calls and bytes both match ik -> certified kernel deficit
++                    //   calls differ                  -> ours is doing different WORK, not slower work
++                    g_prof_type_calls[tt] += 1;
++                    if (node->op == GGML_OP_MUL_MAT)        g_prof_type_calls_mm[tt]   += 1;
++                    if (node->op == GGML_OP_MUL_MAT_ID)     g_prof_type_calls_mmid[tt] += 1;
++                    g_prof_type_bytes[tt] += (uint64_t) ggml_nbytes(w);
++                }
++                const int wi = g_prof_w_find(w);
++                if (wi >= 0) {
++                    g_prof_w_ns[wi]   += prof_dt;
++                    g_prof_w_call[wi] += 1;
++                    if (node->op == GGML_OP_MUL_MAT) {
++                        g_prof_w_by[wi] += ggml_nbytes(w);
++                    } else if (node->op == GGML_OP_GET_ROWS) {
++                        // a row lookup reads one row per index, not the whole table
++                        const struct ggml_tensor * idx = node->src[1];
++                        if (idx && w->ne[0] > 0) {
++                            g_prof_w_by[wi] += (uint64_t) ggml_nelements(idx) *
++                                               (uint64_t) ggml_row_size(w->type, w->ne[0]);
++                        }
++                    } else {
++                        // only the routed experts are read, not all n_as of them - and a
++                        // long prompt can route to the same expert many times over, so the
++                        // count saturates at n_as rather than scaling with the token count
++                        const struct ggml_tensor * ids = node->src[2];
++                        const int64_t n_as = w->ne[2];
++                        int64_t used = ids ? ids->ne[0] * ids->ne[1] : 0;
++                        if (used > n_as) {
++                            used = n_as;
++                        }
++                        if (n_as > 0 && used > 0) {
++                            g_prof_w_by[wi] += (uint64_t) ((double) ggml_nbytes(w) * (double) used / (double) n_as);
++                        }
++                    }
 +                }
 +            }
 +        }
@@ -447,6 +2498,48 @@ index 2728b08..0a5a830 100644
  void ggml_compute_forward_cumsum(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_mean(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_argmax(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cpu/tiled/tiled.cpp b/ggml/src/ggml-cpu/tiled/tiled.cpp
+index 77e1a99..f4b2647 100644
+--- a/ggml/src/ggml-cpu/tiled/tiled.cpp
++++ b/ggml/src/ggml-cpu/tiled/tiled.cpp
+@@ -1204,6 +1204,18 @@ static bool ggml_tiled_min_batch(int64_t rows) {
+     return rows >= 8 || ggml_tiled_matmul_forced();
+ }
+ 
++bool ggml_compute_forward_mul_mat_id_tiled_eligible(const struct ggml_tensor * src0,
++                                                    const struct ggml_tensor * src1,
++                                                    int64_t                    cne1) {
++    if (src0 == NULL) {
++        return false;
++    }
++    if (!ggml_tiled_supported(src0, src1)) {
++        return false;
++    }
++    return ggml_tiled_min_batch(cne1);
++}
++
+ // tiled K-quant matmul; returns true if the op was computed here,
+ // false to fall through to the stock path
+ bool ggml_compute_forward_mul_mat_tiled(
+diff --git a/ggml/src/ggml-cpu/tiled/tiled.h b/ggml/src/ggml-cpu/tiled/tiled.h
+index 6f3e8dc..5b20e6a 100644
+--- a/ggml/src/ggml-cpu/tiled/tiled.h
++++ b/ggml/src/ggml-cpu/tiled/tiled.h
+@@ -26,6 +26,14 @@ bool ggml_compute_forward_mul_mat_id_tiled(const struct ggml_compute_params * pa
+                                            const int32_t *                    expert_rows,
+                                            char *                             scratch);
+ 
++// Conservative upper bound on whether the tiled path would compute this expert: it applies
++// the same type and batch gates as the function above but not the final per-expert dispatch,
++// so it may report true where the dispatch would decline. A caller that needs the expert to
++// fall through to the stock path must require this to be false.
++bool ggml_compute_forward_mul_mat_id_tiled_eligible(const struct ggml_tensor * src0,
++                                                    const struct ggml_tensor * src1,
++                                                    int64_t                    cne1);
++
+ #ifdef __cplusplus
+ }
+ #endif
 diff --git a/ggml/src/ggml-cpu/vec.cpp b/ggml/src/ggml-cpu/vec.cpp
 index 3918a6f..f6e9f33 100644
 --- a/ggml/src/ggml-cpu/vec.cpp
@@ -547,11 +2640,207 @@ index ef0134b..daa5892 100644
  struct ggml_tensor * ggml_sum_rows(
          struct ggml_context * ctx,
          struct ggml_tensor  * a) {
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 9ee64b5..36704bc 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -16,16 +16,94 @@
+ 
+ #include <cinttypes>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <stdexcept>
+ #include <string>
+ #include <unordered_map>
+ 
++#if defined(__linux__)
++#include <sys/mman.h>
++#include <unistd.h>
++#endif
++
+ //
+ // llama_context
+ //
+ 
++// BONSAI_SHIELD: prefill eviction shielding (env-gated, default off).
++//
++// A long prefill routes across most of the expert pool and evicts both the dense backbone
++// and the hot decode experts from the page cache. Two hints, selected by BONSAI_SHIELD:
++//   1 = after a prefill, MADV_WILLNEED the dense tensors once before the first decode token,
++//       so evicted dense pages stream back in one burst
++//   2 = during prefill, MADV_RANDOM the expert tensors so fault-around and readahead do not
++//       pull in unrouted neighbour pages
++//   3 = both
++//   0 or unset = off
++static int bonsai_shield_mode() {
++    static int mode = -1;
++    if (mode < 0) {
++        const char * e = getenv("BONSAI_SHIELD");
++        mode = e ? atoi(e) : 0;
++        if (mode < 0 || mode > 3) {
++            mode = 0;
++        }
++    }
++    return mode;
++}
++
++#if defined(__linux__)
++static void bonsai_madvise_tensor(const ggml_tensor * t, int advice) {
++    if (t == nullptr || t->data == nullptr) {
++        return;
++    }
++    const size_t nbytes = ggml_nbytes(t);
++    if (nbytes == 0) {
++        return;
++    }
++    static const size_t page = (size_t) sysconf(_SC_PAGESIZE);
++    const uintptr_t lo = (uintptr_t) t->data & ~(uintptr_t) (page - 1);
++    const uintptr_t hi = ((uintptr_t) t->data + nbytes + page - 1) & ~(uintptr_t) (page - 1);
++    posix_madvise((void *) lo, hi - lo, advice);
++}
++
++// routed MoE matrices are the expert pool; everything else is the dense backbone, except
++// the 26.8 GiB per-layer embedding table, which is read sparsely and must not be readahead
++static bool bonsai_shield_is_expert(const char * name) {
++    return strstr(name, "_exps.") != nullptr;
++}
++
++static bool bonsai_shield_is_dense(const char * name) {
++    return !bonsai_shield_is_expert(name) && strcmp(name, "per_layer_token_embd.weight") != 0;
++}
++
++static void bonsai_shield_apply(const llama_model & model, bool dense, int advice) {
++    size_t n = 0;
++    size_t nbytes = 0;
++    for (const auto & [name, t] : model.tensors_by_name) {
++        if (t == nullptr || t->data == nullptr) {
++            continue;
++        }
++        const bool want = dense ? bonsai_shield_is_dense(name.c_str()) : bonsai_shield_is_expert(name.c_str());
++        if (want) {
++            bonsai_madvise_tensor(t, advice);
++            n++;
++            nbytes += ggml_nbytes(t);
++        }
++    }
++    static bool reported_dense   = false;
++    static bool reported_expert  = false;
++    bool & reported = dense ? reported_dense : reported_expert;
++    if (!reported) {
++        reported = true;
++        LLAMA_LOG_INFO("%s: BONSAI_SHIELD applied to %zu %s tensors (%.1f MiB)\n",
++                __func__, n, dense ? "dense" : "expert", nbytes / 1048576.0);
++    }
++}
++#endif
++
+ // check that each folded weight in the graph gets its Hadamard transform, and each latent lookup gets the inverse
+ // without this check, an arch that skips the transform helpers loads and computes wrong results
+ static void llama_verify_hadamard_graph(
+@@ -1540,6 +1618,43 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+ 
+         gf = model.build_graph(gparams);
+ 
++        // diagnostic: exact GET_ROWS census, only when BONSAI_GRAPH_NAMES is set
++        if (gf && getenv("BONSAI_GRAPH_NAMES")) {
++            static int gid = 0;
++            const int n_nodes = ggml_graph_n_nodes(gf);
++            int n_get = 0;
++            for (int i = 0; i < n_nodes; ++i) {
++                if (ggml_graph_node(gf, i)->op == GGML_OP_GET_ROWS) ++n_get;
++            }
++            int n_mm = 0, n_mm_f32 = 0, n_mmid = 0;
++            for (int i = 0; i < n_nodes; ++i) {
++                const ggml_tensor * t = ggml_graph_node(gf, i);
++                if (t->op == GGML_OP_MUL_MAT) {
++                    ++n_mm;
++                    if (t->src[0] && t->src[0]->type == GGML_TYPE_F32) ++n_mm_f32;
++                } else if (t->op == GGML_OP_MUL_MAT_ID) {
++                    ++n_mmid;
++                }
++            }
++            fprintf(stderr, "BGRAPH gid=%d n_tokens=%d n_nodes=%d get_rows=%d mm=%d mm_f32=%d mmid=%d\n",
++                    gid, (int) ubatch.n_tokens, n_nodes, n_get, n_mm, n_mm_f32, n_mmid);
++            for (int i = 0; i < n_nodes; ++i) {
++                const ggml_tensor * t = ggml_graph_node(gf, i);
++                if (t->op != GGML_OP_GET_ROWS) continue;
++                const ggml_tensor * a = t->src[0];
++                const ggml_tensor * b = t->src[1];
++                fprintf(stderr, "BGROWS gid=%d i=%d compute=%d dst=[%s] dstshape=[%lld,%lld,%lld,%lld]"
++                        " s0=[%s] s0shape=[%lld,%lld,%lld,%lld] s1=[%s] s1shape=[%lld,%lld,%lld,%lld]\n",
++                        gid, i, (t->flags & GGML_TENSOR_FLAG_COMPUTE) ? 1 : 0, t->name,
++                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
++                        a ? a->name : "?", a ? (long long) a->ne[0] : -1, a ? (long long) a->ne[1] : -1,
++                        a ? (long long) a->ne[2] : -1, a ? (long long) a->ne[3] : -1,
++                        b ? b->name : "?", b ? (long long) b->ne[0] : -1, b ? (long long) b->ne[1] : -1,
++                        b ? (long long) b->ne[2] : -1, b ? (long long) b->ne[3] : -1);
++            }
++            ++gid;
++        }
++
+         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+ 
+         if (!gf) {
+@@ -1999,6 +2114,26 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+ 
+         ggml_status status;
+ 
++#if defined(__linux__)
++        if (bonsai_shield_mode() != 0) {
++            if (ubatch.n_tokens > 1) {
++                if (bonsai_shield_mode() & 2) {
++                    bonsai_shield_apply(model, false, POSIX_MADV_RANDOM);
++                }
++                shield_prefill_pending = true;
++            } else if (shield_prefill_pending) {
++                // first decode token after a prefill: pull the evicted dense pages back once
++                if (bonsai_shield_mode() & 1) {
++                    bonsai_shield_apply(model, true, POSIX_MADV_WILLNEED);
++                }
++                if (bonsai_shield_mode() & 2) {
++                    bonsai_shield_apply(model, false, POSIX_MADV_NORMAL);
++                }
++                shield_prefill_pending = false;
++            }
++        }
++#endif
++
+         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+ 
+         if (!res) {
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 6938fb1..e13fd37 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -431,6 +431,9 @@ private:
+     // true after the prism.hadamard coverage check passes on a reserved graph
+     bool hadamard_verified = false;
+ 
++    // BONSAI_SHIELD: set while a prefill is in flight, cleared by the first decode ubatch
++    bool shield_prefill_pending = false;
++
+     // perf
+     mutable int64_t t_start_us  = 0;
+     mutable int64_t t_load_us   = 0;
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index f69fe63..2372cad 100644
+index f69fe63..0d65bc4 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -2145,6 +2145,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -1162,7 +1162,10 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+ 
+     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+ 
+-    if (inp_rs->s_copy) {
++    // A tensor with no buffer was not referenced by any node of this graph, so the scheduler
++    // never allocated it and nothing will read it: BONSAI_HYBRID_VIEW removes the only consumer
++    // of s_copy on the single-slot decode path. Writing it would dereference a null buffer.
++    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
+         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
+         int32_t * data = (int32_t *) inp_rs->s_copy->data;
+ 
+@@ -2145,6 +2148,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
           ggml_tensor * selected_experts_in) const {
      const int64_t n_embd   = cur->ne[0];
      const int64_t n_tokens = cur->ne[1];
@@ -575,7 +2864,7 @@ index f69fe63..2372cad 100644
      const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
  
      ggml_tensor * logits = nullptr;
-@@ -2455,34 +2472,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2455,34 +2475,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
  
      ggml_build_forward_expand(gf, experts);
  
@@ -593,6 +2882,12 @@ index f69fe63..2372cad 100644
 -
 -        ggml_build_forward_expand(gf, cur_experts[i]);
 -    }
+-
+-    // aggregate experts
+-    ggml_tensor * moe_out = cur_experts[0];
+-
+-    for (uint32_t i = 1; i < n_expert_used_il; ++i) {
+-        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
 +    // Aggregate the experts in one pass. The previous form emitted a view per
 +    // expert plus a chain of n_expert_used-1 adds: top-10 routing meant 10 views
 +    // and 9 adds per layer, ~912 nodes per token, roughly a third of the decode
@@ -601,12 +2896,6 @@ index f69fe63..2372cad 100644
 +    // returns a contiguous tensor, so no ggml_cont is needed for n_expert_used==1.
 +    ggml_tensor * moe_out = ggml_moe_sum(ctx0, experts);
  
--    // aggregate experts
--    ggml_tensor * moe_out = cur_experts[0];
--
--    for (uint32_t i = 1; i < n_expert_used_il; ++i) {
--        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
--
 -        ggml_build_forward_expand(gf, moe_out);
 -    }
 -
@@ -618,3 +2907,180 @@ index f69fe63..2372cad 100644
  
      cb(moe_out, "ffn_moe_out", il);
  
+@@ -3761,6 +3764,22 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
+     return (llm_graph_input_dsv4 *) res->add_input(std::move(inp));
+ }
+ 
++// BONSAI_HYBRID_VIEW: skip the recurrent-state gather when it is provably the identity.
++// With one state slot and one sequence, state_copy is [0] and the gather copies the whole
++// state array ([state_size, 1]); the layer only reads it and the updated state is written
++// back later by a separate cpy into s, so the copy can be replaced by a view.
++// Default ON from Stage 10: it won both mirrored decode passes (+4.30% / +6.71%) and is
++// neutral-or-better on prefill (+0.69% / +0.57%), and it is bit-exact on device. Set
++// BONSAI_HYBRID_VIEW=0 to restore the gather (kept as the control).
++static int bonsai_hybrid_view_enabled() {
++    static int mode = -1;
++    if (mode < 0) {
++        const char * e = getenv("BONSAI_HYBRID_VIEW");
++        mode = (!e || atoi(e) != 0) ? 1 : 0;
++    }
++    return mode;
++}
++
+ ggml_tensor * llm_graph_context::build_rs(
+         ggml_tensor * s,
+         ggml_tensor * state_copy,
+@@ -3771,7 +3790,8 @@ ggml_tensor * llm_graph_context::build_rs(
+            uint32_t   rs_head,
+            uint32_t   rs_size,
+             int32_t   rs_zero,
+-        const llm_graph_get_rows_fn & get_state_rows) const {
++        const llm_graph_get_rows_fn & get_state_rows,
++                         bool rs_identity) const {
+ 
+     GGML_UNUSED(rs_size);
+     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
+@@ -3787,19 +3807,29 @@ ggml_tensor * llm_graph_context::build_rs(
+     // {state_size, rs_size} -> {state_size, n_rs - i0}
+     const int64_t i0 = n_rs - state_copy->ne[0];
+ 
+-    ggml_tensor * states_all = ggml_get_rows(ctx0, states, state_copy);
++    // The identity case is exactly one state slot for one sequence: any other shape needs the
++    // gather, because state_copy may permute or repeat rows. With n_rs == n_seqs == 1 the extra
++    // states below are zero-sized, so no self-copy of s into s is created.
++    GGML_ASSERT(!rs_identity || (n_rs == 1 && n_seqs == 1));
++    ggml_tensor * states_all = rs_identity
++        ? ggml_view_2d(ctx0, states, state_size, 1, states->nb[1], 0)
++        : ggml_get_rows(ctx0, states, state_copy);
+ 
+     ggml_tensor * output_states = get_state_rows ?
+         get_state_rows(ctx0, states, state_copy_main) :
+         ggml_view_2d(ctx0, states_all, state_size, n_seqs, states_all->nb[1], 0);
+     ggml_build_forward_expand(gf, output_states);
+ 
+-    // copy extra states which won't be changed further (between n_seqs and n_rs)
+-    ggml_tensor * states_extra = ggml_view_2d(ctx0, states_all, state_size, n_rs - n_seqs, states_all->nb[1], (n_seqs - i0)*states_all->nb[1]);
+-    ggml_build_forward_expand(gf,
+-        ggml_cpy(ctx0,
+-            states_extra,
+-            ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1])));
++    // copy extra states which won't be changed further (between n_seqs and n_rs).
++    // With a single state slot this copy is zero rows: building it would create a zero-sized
++    // view whose buffer the scheduler never assigns, which asserts. It is a no-op, so skip it.
++    if (!rs_identity) {
++        ggml_tensor * states_extra = ggml_view_2d(ctx0, states_all, state_size, n_rs - n_seqs, states_all->nb[1], (n_seqs - i0)*states_all->nb[1]);
++        ggml_build_forward_expand(gf,
++            ggml_cpy(ctx0,
++                states_extra,
++                ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1])));
++    }
+ 
+     return output_states;
+ }
+@@ -3847,9 +3877,17 @@ ggml_tensor * llm_graph_context::build_rs(
+     // state: it still holds the n_rs - n_seqs extra states and copies no state of a single sequence ubatch
+     ggml_tensor * state_copy = get_state_rows ? inp->s_copy_tail : inp->s_copy;
+ 
++    // The gather is the identity only when the copy plan selects row 0 itself: s_copy(i) is
++    // cells[i].src0, a real copy plan, so n_rs == 1 alone does NOT imply the mapping is [0].
++    const bool rs_identity = bonsai_hybrid_view_enabled()
++        && !get_state_rows
++        && n_seqs == 1
++        && kv_state->get_n_rs() == 1
++        && kv_state->s_copy(0) == 0;
++
+     return build_rs(s, state_copy, inp->s_copy_main, state_size, n_seqs,
+                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
+-                    get_state_rows);
++                    get_state_rows, rs_identity);
+ }
+ 
+ ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index e853a02..676b77d 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1389,7 +1389,8 @@ struct llm_graph_context {
+                uint32_t   rs_head,
+                uint32_t   rs_size,
+                 int32_t   rs_zero,
+-            const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
++            const llm_graph_get_rows_fn & get_state_rows = nullptr,
++                             bool rs_identity = false) const;
+ 
+     llm_graph_input_rs * build_rs_inp() const;
+ 
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index 80a7196..a9b37f2 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -518,6 +518,19 @@ struct llama_mmap::impl {
+         for (const auto & range : lazy_ranges) {
+             advise(range.first, range.second, POSIX_MADV_RANDOM, "POSIX_MADV_RANDOM");
+         }
++#ifdef MADV_HUGEPAGE
++        // 2 MB pages multiply TLB reach for the demand-paged expert path. Opt-in so one
++        // binary can A/B it; confirm with FilePmdMapped in smaps, not with t/s.
++        static const bool thp = []() -> bool {
++            const char * e = getenv("BONSAI_THP");
++            return e != nullptr && atol(e) != 0;
++        }();
++        if (thp) {
++            if (madvise(addr, file->size(), MADV_HUGEPAGE) != 0) {
++                LLAMA_LOG_WARN("warning: madvise(.., MADV_HUGEPAGE) failed: %s\n", strerror(errno));
++            }
++        }
++#endif
+         if (numa) {
+             if (posix_madvise(addr, file->size(), POSIX_MADV_RANDOM)) {
+                 LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_RANDOM) failed: %s\n",
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index 9c60667..51a4913 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -286,7 +286,21 @@ static void llama_tensor_dequantize_impl(
+ 
+ static bool tensor_allows_quantization(const llama_model_quantize_params * params, llm_arch arch, const ggml_tensor * tensor) {
+     // trivial checks first -- no string ops needed
+-    if (params->only_copy)       return false;
++    if (params->only_copy) {
++        // COPY raw-copies every tensor, with one exception: an explicit --tensor-type match is
++        // re-quantized. Without this the flag is silently dead in COPY mode, which is the only
++        // mode that keeps unmatched tensors bit-exact.
++        if (params->tt_overrides == nullptr || ggml_n_dims(tensor) < 2) {
++            return false;
++        }
++        const std::string name = ggml_get_name(tensor);
++        for (const auto * p = params->tt_overrides; p->pattern != nullptr; p++) {
++            if (std::regex_search(name, std::regex(p->pattern))) {
++                return p->type != tensor->type;
++            }
++        }
++        return false;
++    }
+ 
+     // quantize only 2D and 3D tensors (experts)
+     if (ggml_n_dims(tensor) < 2) return false;
+@@ -720,6 +734,22 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type
+ 
+ // outer wrapper: determine the ggml_type that this tensor should be quantized to
+ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_model_quantize_params * params, const ggml_tensor * tensor, ggml_type default_type, const tensor_metadata & tm) {
++    if (params->only_copy) {
++        // COPY: raw-copy unless --tensor-type names this tensor, in which case the requested
++        // type is used as-is. The mixture logic and default_type (F32 for COPY) do not apply.
++        const std::string tensor_name(tensor->name);
++        for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
++            if (std::regex_search(tensor_name, pattern)) {
++                if (qtype != tensor->type) {
++                    LLAMA_LOG_WARN("%s: %-36s - COPY override: %s -> %s\n",
++                                   __func__, tensor_name.c_str(),
++                                   ggml_type_name(tensor->type), ggml_type_name(qtype));
++                }
++                return tensor_type_fallback(qs, tensor, qtype);
++            }
++        }
++        return tensor->type;
++    }
+     if (!tensor_allows_quantization(params, qs.model.arch, tensor)) {
+         return tensor->type;
+     }

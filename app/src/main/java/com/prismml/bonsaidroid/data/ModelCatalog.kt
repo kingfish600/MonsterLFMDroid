@@ -59,18 +59,31 @@ object ModelCatalog {
     private const val SHARD1 = "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf"
     private const val SHARD2 = "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf"
 
+    /**
+     * Shard 1 is the varH dense rewrite, not the byte stream the upstream repo serves.
+     * varH requantises the 192 `blk.N.hc_{attn,ffn}_{up,down}.weight` matrices from BF16
+     * to Q8_0, which removes 562.5 MiB of dense bytes per token for +0.092% perplexity
+     * (32 chunks, t = 1.02) and measures +8.19% decode on device (4/4 mirrored pairs,
+     * t = 7.09). Shard 2 is untouched and byte-identical to upstream, so only shard 1
+     * differs: 37,623,740,192 -> 37,033,916,192 bytes.
+     *
+     * The hosted URL still serves the un-rewritten shard 1, so a fresh download will not
+     * match [ModelAsset.sha256] below and the rewritten shard must be published before
+     * this asset can be re-downloaded. A device that already holds varH is unaffected.
+     */
     val assets: List<ModelAsset> = listOf(
         ModelAsset(
             id = "flashnext-q2_0",
             kind = AssetKind.TARGET_MODEL,
             fileName = SHARD1,
             url = "$REPO/$SHARD1",
-            sizeBytes = 37_623_740_192L,
-            summary = "Qwen3.8-Flash-Next, 176B MoE at ~2.4 bpw (Q2_0). " +
+            sizeBytes = 37_033_916_192L,
+            summary = "Qwen3.8-Flash-Next, 176B MoE at ~2.4 bpw (Q2_0), with the 192 " +
+                "hc_* dense matrices requantised BF16 -> Q8_0 (-562.5 MiB). " +
                 "~6B params active per token, so decode touches ~0.7 GB of " +
                 "experts; the other ~34 GB streams from flash. Both shards are " +
                 "required - shard 2 alone is a 28.8 GB n-gram table.",
-            sha256 = "69820c02ec7d0b45ef2ebb19d6620299db749fe2aded7f39f93c6b88b199b720",
+            sha256 = "e7c694526e82f633eda7f37b5e35ed7075fd39140018c99d73e305818ded12e2",
             extraFiles = listOf(SHARD2),
             extraSizes = listOf(28_800_138_432L),
         ),
