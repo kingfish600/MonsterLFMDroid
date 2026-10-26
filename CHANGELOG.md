@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.1.1-alpha - signing fix
+
+**Fixes an install failure reported on a OnePlus 13 / Android 16:**
+`Parsing failed: APK contains no signature files.`
+
+The cause was not a missing signature but a missing *scheme*. AGP disables v1
+(JAR) signing whenever `minSdk >= 24`, and this app is `minSdk 31`, so the
+0.1.0-alpha APK carried only an APK Signature Scheme v2 signature in the signing
+block - with no `META-INF/CERT.SF` / `CERT.RSA` files at all. Android 7+ accepts
+that, but some OEM installer paths (OxygenOS/ColorOS, and third-party file
+managers) read the JAR manifest and report exactly that error.
+
+Fixed by signing with all three schemes:
+
+```kotlin
+enableV1Signing = true
+enableV2Signing = true
+enableV3Signing = true
+```
+
+Verified on the rebuilt APK:
+
+| | 0.1.0-alpha | 0.1.1-alpha |
+|---|---|---|
+| `META-INF/CERT.SF` + `CERT.RSA` | absent | **present** |
+| v1 scheme (JAR signing) | false | **true** |
+| v2 scheme | true | **true** |
+| v3 scheme | false | **true** |
+| `jarsigner -verify` | n/a | **jar verified** |
+
+Note when checking this yourself: `apksigner verify --verbose` reports
+`Verified using v1 scheme: false` on an APK that *does* have a v1 signature,
+because it skips v1 verification when `minSdk >= 24` (v2/v3 suffice there). Pass
+`--min-sdk-version 21` to force it, or check for `META-INF/CERT.RSA` directly.
+
+The signing key is unchanged (same debug keystore), so this installs as an in-place
+update over 0.1.0-alpha without losing app data - which matters here because the
+model lives in the app's external files directory and is deleted on uninstall.
+
 ## 0.1.0-alpha - first public build
 
 First alpha. Runs a ~176B-parameter hybrid MoE (Qwen3.8-Flash-Next, 512 experts,

@@ -17,8 +17,8 @@ android {
         applicationId = "io.github.kingfish600.monsterqwendroid"
         minSdk = 31              // Android 12+; RedMagic 10S Pro ships 15/16
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0-alpha"
+        versionCode = 2
+        versionName = "0.1.1-alpha"
 
         ndk {
             // Snapdragon 8 Elite is arm64 only.
@@ -33,6 +33,16 @@ android {
             storePassword = "android"
             keyAlias = "androiddebugkey"
             keyPassword = "android"
+            // AGP disables v1 (JAR) signing whenever minSdk >= 24, which leaves the
+            // APK signed with v2 only - no META-INF signature files at all. Android
+            // 7+ accepts that, but some OEM installer paths (OxygenOS/ColorOS, and
+            // third-party file managers) read the JAR manifest and fail with
+            // "Parsing failed: APK contains no signature files". Enable all three
+            // schemes: v1 for those installers, v2/v3 for modern Android.
+            // See issue: OnePlus 13 / Android 16 could not install 0.1.0-alpha.
+            enableV1Signing = true
+            enableV2Signing = true
+            enableV3Signing = true
         }
     }
 
