@@ -8,7 +8,7 @@ M=/mnt/nvme4tb/models/LFM2.5-24B-A2B-Q4_K_M.gguf
 what=${1:-all}
 $ADB shell mkdir -p $DEVDIR
 if [ "$what" = all ] || [ "$what" = bin ]; then
-  for f in libggml-base.so libggml-cpu.so libggml.so libllama.so llama-cli llama-server llama-bench; do
+  for f in $(ls $B); do
     echo "push $f"; $ADB push $B/$f $DEVDIR/$f >/dev/null
   done
   $ADB shell chmod 755 $DEVDIR/llama-cli $DEVDIR/llama-server $DEVDIR/llama-bench
