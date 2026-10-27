@@ -20,3 +20,5 @@ Stock llama.cpp `master` @ `e86f5fd` (ndk r28, `-march=armv8.2-a+dotprod+i8mm+fp
 
 Host x86 reference (16t, e86f5fd): decode 33.6 t/s, prefill 219 t/s.
 Fallback if page-cache residency fails on-device: `LFM2.5-24B-A2B-QAD-Q4_0.gguf` (13.58 GB, sha d1c03f73… verified) is on the host at /mnt/nvme4tb/models/ — push it to /data/local/tmp/lfm/ and run night.sh with M pointed at it.
+
+Midday device test (RedMagic NX789J, GameSpace, no fan): QAD-Q4_0 **14.49 t/s**, Q4_K_M 12.55 t/s vs monster 6.95 → QAD is the pick (fastest on host AND device, smallest). Prefill weak (18–22 t/s) vs host 200 — cold-cache streaming likely; warm-decode grep missed (llama-cli output format), rerun with llama-server protocol next session. t=6 only tested so far.
