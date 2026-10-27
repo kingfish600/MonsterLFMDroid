@@ -49,7 +49,7 @@ private fun diagnosticBundle(
     fallback: String?,
     logs: List<String>,
 ): String = buildString {
-    appendLine("== MonsterQwenDroid diagnostics ==")
+    appendLine("== MonsterLFMDroid diagnostics ==")
     appendLine(
         "build: v${com.prismml.bonsaidroid.BuildConfig.VERSION_NAME} " +
             "(${com.prismml.bonsaidroid.BuildConfig.VERSION_CODE})"

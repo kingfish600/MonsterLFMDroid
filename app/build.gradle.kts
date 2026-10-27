@@ -14,11 +14,11 @@ android {
     defaultConfig {
         // applicationId differs so both apps coexist; namespace is kept from the
         // BonsaiDroid scaffolding so the reused Kotlin needs no renaming.
-        applicationId = "io.github.kingfish600.monsterqwendroid"
+        applicationId = "io.github.kingfish600.monsterlfmdroid"
         minSdk = 31              // Android 12+; RedMagic 10S Pro ships 15/16
         targetSdk = 34
-        versionCode = 2
-        versionName = "0.1.1-alpha"
+        versionCode = 3
+        versionName = "0.2.0-lfm"
 
         ndk {
             // Snapdragon 8 Elite is arm64 only.

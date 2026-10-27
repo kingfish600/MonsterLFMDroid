@@ -131,25 +131,24 @@ data class EngineProfile(
     val pinBatchAllCores: Boolean = true,
 ) {
     companion object {
-        // Flash-Next is a 176B MoE: ~0.7 GB of expert weights are touched per
-        // token. The KV cache is small by design (only 12 of 48 layers hold K/V,
-        // 2 kv heads x 256), so context is cheap and the weight cache matters
-        // more than the context number.
+        // LFM2.5-24B-A2B: 2B active params per token (~1.2 GB touched at
+        // Q4_0); the whole 13.58 GB file lives in RAM. Hybrid conv keeps KV
+        // small, so context is cheap and decode wants all 8 cores.
         val QUALITY = EngineProfile(
             name = "QUALITY",
             contextTokens = 32_768,
             reasoningEffort = "xhigh", // most accurate with a big budget
             pollPercent = 0,
-            threads = 6,
-            threadsBatch = 8,
+            threads = 8,
+            threadsBatch = 0, // no -tb: batch pool then inherits -t 8 and the 0xff mask
         )
         val BALANCED = EngineProfile(
             name = "BALANCED",
             contextTokens = 8_192,
             reasoningEffort = "medium",
             pollPercent = 0,
-            threads = 6,
-            threadsBatch = 8,
+            threads = 8,
+            threadsBatch = 0, // no -tb: batch pool then inherits -t 8 and the 0xff mask
         )
         val SPEED = EngineProfile(
             name = "SPEED",
@@ -157,9 +156,9 @@ data class EngineProfile(
             outputBudget = 4_096,
             reasoningEffort = "low",
             pollPercent = 100,
-            threads = 6,
-            moeTopK = 8,          // +8% decode for ~+3-5% perplexity on this phone
-            threadsBatch = 8,
+            threads = 8,
+            moeTopK = 0,          // BONSAI-fork knob; no-op on the stock lfm2moe engine
+            threadsBatch = 0, // no -tb: batch pool then inherits -t 8 and the 0xff mask
         )
         val THERMAL_SAVER = EngineProfile(
             name = "THERMAL_SAVER",

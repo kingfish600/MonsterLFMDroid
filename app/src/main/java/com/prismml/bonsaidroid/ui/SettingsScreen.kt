@@ -175,7 +175,7 @@ fun SettingsScreen(vm: AppViewModel) {
             }
             androidx.compose.material3.IconButton(onClick = {
                 clipboard.setText(androidx.compose.ui.text.AnnotatedString(
-                    "MonsterQwenDroid full runtime log\n" + logs.joinToString("\n")
+                    "MonsterLFMDroid full runtime log\n" + logs.joinToString("\n")
                 ))
                 copiedTick = System.currentTimeMillis()
             }) {

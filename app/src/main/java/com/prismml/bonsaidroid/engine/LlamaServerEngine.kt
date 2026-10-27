@@ -417,9 +417,8 @@ class LlamaServerEngine(private val context: Context) : BonsaiEngine {
             "--host", if (p.exposeOnWifi) "0.0.0.0" else "127.0.0.1",
             "--port", port.toString(),
             "-c", p.contextTokens.toString(),
-            // Checkpoints copy the whole KV (~150 MB at 8k q4_0) mid-decode;
-            // useless for linear chats and a visible stutter source.
-            "-ctxcp", "0",
+            // No -ctxcp: checkpointing was removed upstream at e86f5fd, and
+            // copying the whole KV mid-decode was a stutter source anyway.
             "-np", "1",
             "-fa", if (p.flashAttn) "on" else "off",
             "--cache-type-k", p.kvCacheTypeK,
@@ -441,7 +440,9 @@ class LlamaServerEngine(private val context: Context) : BonsaiEngine {
         // unpinned (3.5 -> 4.4 t/s) with identical output; only applied when the
         // device actually has the 6-core perf cluster.
         if (p.pinPerfCluster && Runtime.getRuntime().availableProcessors() >= 6) {
-            args += listOf("--cpu-mask", "0x3f", "--cpu-strict", "1")
+            // 0xff = all 8 cores incl. the 2x 4.32 GHz primes; the old 0x3f
+            // perf-cluster mask excluded the primes and cost ~30% decode.
+            args += listOf("--cpu-mask", "0xff", "--cpu-strict", "1")
             // The batch pool does not inherit --cpu-mask when -tb is passed, so it needs
             // its own mask or it runs unpinned across both clusters. Prompt processing is
             // compute-bound, so it wants all eight cores rather than the perf cluster.
@@ -625,7 +626,7 @@ class LlamaServerEngine(private val context: Context) : BonsaiEngine {
         val weightsBytes = spec.target.length() + (spec.draft?.length() ?: 0L)
         if (weightsBytes > budget) {
             Log.i(
-                "MonsterQwenDroid",
+                "MonsterLFMDroid",
                 "weights %.1f GB exceed free RAM - mmap demand-paging owns the difference"
                     .format(weightsBytes / 1e9)
             )
