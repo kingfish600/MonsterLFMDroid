@@ -17,7 +17,7 @@ if [ "$1" = server ]; then
 fi
 for T in 4 6 8; do
   echo "===== llama-bench t=$T pp512+tg128 ====="
-  ./llama-bench -m $M $COMMON $MLOCK -t $T -p 512 -n 128 -r 3
+  ./llama-bench -m $M $COMMON -t $T -p 512 -n 128 -r 3
 done
 for RUN in cold warm; do
   echo "===== decode test ($RUN, mlock=${MLOCK:-off}) ====="
