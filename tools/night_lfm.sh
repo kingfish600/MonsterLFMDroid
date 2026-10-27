@@ -10,7 +10,7 @@ cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | sort -n | tail -1 | awk 
 nproc; cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | sort | uniq -c
 if [ "$1" = server ]; then
   echo "== long-lived server mode (GOAL.md protocol) on :8080 =="
-  ./llama-server -m $M $COMMON -c 8192 -t 8 --host 127.0.0.1 --port 8080
+  ./llama-server -m $M $COMMON -lm none -c 8192 -t 8 --host 127.0.0.1 --port 8080
   exit 0
 fi
 T_LIST=8
