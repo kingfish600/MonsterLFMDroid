@@ -3,7 +3,7 @@
 # Push with deploy_lfm.sh first. Run: /data/local/tmp/lfm/night.sh [bench|server]
 cd /data/local/tmp/lfm || exit 1
 export LD_LIBRARY_PATH=/data/local/tmp/lfm
-M=./LFM2.5-24B-A2B-Q4_K_M.gguf
+M=./LFM2.5-24B-A2B-QAD-Q4_0.gguf   # primary: won host (38.6) AND phone (14.49 t/s), smallest file
 COMMON="-ngl 0 -fa on --cache-type-k q8_0 --cache-type-v q8_0 --cpu-mask 0x3f --cpu-strict 1"
 echo "== device snapshot =="; grep -E "MemTotal|MemAvailable|MemFree" /proc/meminfo
 cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | sort -n | tail -1 | awk '{printf "hottest zone: %.1f C\n", $1/1000}'
@@ -21,15 +21,15 @@ for RUN in cold warm; do
   echo "===== decode test ($RUN) ====="
   ./llama-cli -m $M $COMMON -c 2048 -t 6 -st -p "List three facts about the Moon." -n 64 --temp 0 2>&1 | grep -E "Prompt eval|Eval time|load time|t/s"
 done
-# QAD-Q4_0 variant: fastest on host (38.6 t/s), 1 GB smaller — head-to-head, same protocol.
-if [ -f ./LFM2.5-24B-A2B-QAD-Q4_0.gguf ]; then
-  MQ=./LFM2.5-24B-A2B-QAD-Q4_0.gguf
-  echo "===== QAD-Q4_0 llama-bench t=6 ====="
+# Q4_K_M head-to-head (daytime phone: 12.55 vs QAD 14.49).
+if [ -f ./LFM2.5-24B-A2B-Q4_K_M.gguf ]; then
+  MQ=./LFM2.5-24B-A2B-Q4_K_M.gguf
+  echo "===== Q4_K_M llama-bench t=6 ====="
   ./llama-bench -m $MQ $COMMON -t 6 -p 512 -n 128 -r 3
-  echo "===== QAD-Q4_0 decode warm ====="
+  echo "===== Q4_K_M decode warm ====="
   ./llama-cli -m $MQ $COMMON -c 2048 -t 6 -st -p "List three facts about the Moon." -n 64 --temp 0 2>&1 | grep -E "Prompt eval|Eval time|load time|t/s"
 fi
-# optional: hard-lock 14.5 GB in RAM (ulimit -l unlimited verified working on Android shell).
+# optional: hard-lock 12.6 GB in RAM (ulimit -l unlimited verified working on Android shell).
 # kept separate from main runs: if LMKD dislikes locked memory we still have clean baseline numbers.
 echo "===== mlock attempt (locked RAM test) ====="
 ( ulimit -l unlimited 2>/dev/null
