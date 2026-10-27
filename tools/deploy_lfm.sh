@@ -16,6 +16,9 @@ fi
 if [ "$what" = all ] || [ "$what" = model ]; then
   echo "pushing LFM2.5-24B-A2B-Q4_K_M.gguf (few minutes over USB)..."; $ADB push $M $DEVDIR/LFM2.5-24B-A2B-Q4_K_M.gguf
   echo "device sha:"; $ADB shell sha256sum $DEVDIR/LFM2.5-24B-A2B-Q4_K_M.gguf; echo "host   sha:"; sha256sum $M
+  M2=/mnt/nvme4tb/models/LFM2.5-24B-A2B-QAD-Q4_0.gguf
+  echo "pushing LFM2.5-24B-A2B-QAD-Q4_0.gguf (fastest host result, 1 GB smaller)..."; $ADB push $M2 $DEVDIR/LFM2.5-24B-A2B-QAD-Q4_0.gguf
+  echo "device sha:"; $ADB shell sha256sum $DEVDIR/LFM2.5-24B-A2B-QAD-Q4_0.gguf; echo "host   sha:"; sha256sum $M2
 fi
 $ADB push tools/night_lfm.sh $DEVDIR/night.sh && $ADB shell chmod 755 $DEVDIR/night.sh
 echo "deploy done -> $DEVDIR"

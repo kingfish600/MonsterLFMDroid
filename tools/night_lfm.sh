@@ -21,6 +21,14 @@ for RUN in cold warm; do
   echo "===== decode test ($RUN) ====="
   ./llama-cli -m $M $COMMON -c 2048 -t 6 -st -p "List three facts about the Moon." -n 64 --temp 0 2>&1 | grep -E "Prompt eval|Eval time|load time|t/s"
 done
+# QAD-Q4_0 variant: fastest on host (38.6 t/s), 1 GB smaller — head-to-head, same protocol.
+if [ -f ./LFM2.5-24B-A2B-QAD-Q4_0.gguf ]; then
+  MQ=./LFM2.5-24B-A2B-QAD-Q4_0.gguf
+  echo "===== QAD-Q4_0 llama-bench t=6 ====="
+  ./llama-bench -m $MQ $COMMON -t 6 -p 512 -n 128 -r 3
+  echo "===== QAD-Q4_0 decode warm ====="
+  ./llama-cli -m $MQ $COMMON -c 2048 -t 6 -st -p "List three facts about the Moon." -n 64 --temp 0 2>&1 | grep -E "Prompt eval|Eval time|load time|t/s"
+fi
 # optional: hard-lock 14.5 GB in RAM (ulimit -l unlimited verified working on Android shell).
 # kept separate from main runs: if LMKD dislikes locked memory we still have clean baseline numbers.
 echo "===== mlock attempt (locked RAM test) ====="
