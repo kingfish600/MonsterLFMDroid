@@ -46,6 +46,79 @@ the device (`/proc/<pid>/cmdline`) and matches what is intended, including
 `--load-mode none`. Threading is correct: 8 workers, each pinned to its own core
 0-7 (`Cpus_allowed_list` per thread).
 
+## SOLVED: the clock boost is the whole story (and it is a 49% win)
+The prime cores were running at a quarter speed because **RedMagic only boosts
+apps listed in `NubiaperformanceMode`**. The original MonsterQwenDroid
+(`com.prismml.moedroid`) was in that list; none of the forks were. Granting the
+LFM fork the same `+300` entry:
+
+```sh
+adb shell settings put global NubiaperformanceMode \
+  "com.pocketpalai+300,com.prismml.moedroid+300,io.github.kingfish600.monsterlfmdroid+300,"
+```
+
+| | before | after |
+|---|---|---|
+| cpu0 (perf, max 3532) | 1996 MHz | **3532 MHz (max)** |
+| cpu6 (prime, max 4473) | 1017–1958 MHz | **2841–3840 MHz** |
+| decode (single) | 24.1 t/s | **35.9 t/s** |
+| **sustained (5 × 300 tok)** | — | **36.15 / 35.73 / 36.14 / 36.02 t/s** |
+
+`+49%`, and it reproduces sustained: ~36 t/s flat across 1500 tokens with cpu6
+holding 2.8–3.8 GHz. This single setting explains the entire 22-vs-36 t/s spread
+that no amount of flag tuning could account for.
+
+**Original value was backed up** to `~/.perfmode-backup.txt`
+(`com.pocketpalai+300,com.prismml.moedroid+300,`). The supported equivalent is to
+add the app through RedMagic's Game Space UI, which survives updates better than a
+direct `settings put`.
+
+**Implication for every earlier comparison in this project:** the monster's
+6.945 t/s was measured **with** the boost; our forks were measured **without** it.
+LFM's ~36 t/s is therefore achieved from a level playing field — the earlier
+~25 t/s figures understated the fork by ~45%.
+
+## Negative result: DSpark draft speculation loses on x86 (evaluated)
+LiquidAI ships a purpose-built drafter for this exact target:
+`LiquidAI/LFM2.5-24B-A2B-DSpark-GGUF` → `LFM2.5-24B-A2B-DSpark-F16.gguf`
+(0.62 GiB, sha256 `0cd847ca…a1b1a0f`, verified). It is a sidecar: 5 attention
+layers, rank-256 Markov head, confidence head, **block size 9**, sharing the
+target's embeddings and LM head at load time.
+
+**It loads cleanly on our engine revision** — the shared-tensor concern that
+affects Flash-Next's `shared-` heads does not apply here:
+```
+adding speculative implementation 'draft-dspark'
+- n_max=9, n_min=0, p_min=0.00
+- block_size=9, mask_token_id=125017, n_extract=5, sample_from_anchor=true
+```
+Official invocation: `-md <sidecar> --spec-type draft-dspark --spec-draft-n-max 9
+--spec-draft-n-min 0 -fa on`.
+
+Host x86, same prompt, temp 0, 400 tokens (`LFM2.5-24B-A2B-Q4_K_M` target):
+
+| config | decode | acceptance |
+|---|---|---|
+| **baseline (no draft)** | **36.40** | — |
+| n_max=4 p_min=0.3 | 34.36 | 63.7% |
+| n_max=4 p_min=0.5 | 31.72 | 78.1% |
+| n_max=4 p_min=0.7 | 30.46 | 84.7% |
+| n_max=6 p_min=0.7 | 30.32 | 81.7% |
+| n_max=2 p_min=0.5 | 31.36 | 76.1% |
+| n_max=9 p_min=0 | 19.29 | 18.4% |
+
+**No configuration beats the baseline** — best case is 5.6% slower. Two notable
+findings: the confidence threshold `p_min` transforms acceptance (18% → 85%), but
+counter-intuitively *higher* acceptance is *slower*, so the drafter's own cost, not
+acceptance, is the binding constraint. At `n_max=4` the sidecar must cost under 75%
+of a target token to win; it reads 0.62 GB/token in F16 against the target's
+~1.06 GB/token, and evidently does not clear that bar in practice.
+
+This matches the project's only other speculation measurement (MTP on the monster:
+0.52×). **Recommendation: do not ship speculation for LFM.** It costs RAM and
+complexity for a measured loss. Retained here because the phone's regime
+(bandwidth-bound) differs from x86 and deserved a direct check.
+
 ## Negative result: `--cache-ram` is innocent
 The in-app/shell gap looked like the app's `--cache-ram 24576` (a 24 GB prompt
 cache). An interleaved A/B — alternating arms so drift hits both equally — says no:
