@@ -5,6 +5,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -63,6 +64,7 @@ fun ChatScreen(vm: AppViewModel) {
     val error by vm.error.collectAsState()
     val thermal by vm.governor.reading.collectAsState()
     val sessions by vm.chats.sessions.collectAsState()
+    val speaking by vm.speaking.collectAsState()
     val reasoning by vm.reasoning.collectAsState()
 
     var input by rememberSaveable { mutableStateOf("") }
@@ -161,7 +163,15 @@ fun ChatScreen(vm: AppViewModel) {
                     )
                 }
             }
-            items(turns) { turn -> Bubble(turn) }
+            items(turns) { turn ->
+                val isLastAssistant = turn.role != "user" &&
+                    turns.lastOrNull { it.role != "user" } === turn
+                Bubble(
+                    turn = turn,
+                    speaking = speaking && isLastAssistant,
+                    onSpeak = { vm.speak(turn.content) },
+                )
+            }
         }
 
         Row(
@@ -250,7 +260,11 @@ fun ChatScreen(vm: AppViewModel) {
 
 @OptIn(ExperimentalTextApi::class)
 @Composable
-private fun Bubble(turn: com.prismml.bonsaidroid.data.ChatTurn) {
+private fun Bubble(
+    turn: com.prismml.bonsaidroid.data.ChatTurn,
+    speaking: Boolean = false,
+    onSpeak: () -> Unit = {},
+) {
     val isUser = turn.role == "user"
     val clipboard = LocalClipboardManager.current
     Card(
@@ -280,7 +294,22 @@ private fun Bubble(turn: com.prismml.bonsaidroid.data.ChatTurn) {
                 RichAnswer(turn.content.ifBlank { "" })
             }
             if (turn.content.isNotBlank()) {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    // Read aloud. Only on assistant turns, and only once there is
+                    // something to say.
+                    if (!isUser) {
+                        TextButton(
+                            onClick = onSpeak,
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                        ) {
+                            Text(if (speaking) "◼ stop" else "🔊 speak",
+                                style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
                     IconButton(
                         onClick = { clipboard.setText(AnnotatedString(turn.content)) },
                         modifier = Modifier.padding(0.dp),
@@ -292,6 +321,10 @@ private fun Bubble(turn: com.prismml.bonsaidroid.data.ChatTurn) {
                         )
                     }
                 }
+            }
+            // ASCII waveform while this reply is being spoken.
+            if (!isUser && speaking) {
+                AsciiSpeaker(playing = true, modifier = Modifier.padding(top = 6.dp))
             }
         }
     }

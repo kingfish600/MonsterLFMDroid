@@ -3,8 +3,10 @@ package com.prismml.bonsaidroid.ui
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.prismml.bonsaidroid.data.AssetKind
 import com.prismml.bonsaidroid.data.ChatTurn
 import com.prismml.bonsaidroid.data.ModelAsset
+import com.prismml.bonsaidroid.data.ModelCatalog
 import com.prismml.bonsaidroid.data.ModelDownloader
 import com.prismml.bonsaidroid.engine.ChatMessage
 import com.prismml.bonsaidroid.engine.CompletionEvent
@@ -14,6 +16,8 @@ import com.prismml.bonsaidroid.engine.ModelSpec
 import com.prismml.bonsaidroid.harness.BenchHarness
 import com.prismml.bonsaidroid.service.InferenceService
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -190,6 +194,72 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             _loaded.value = null
         }
     }
+
+    // ---------------------------------------------------------------- speech
+
+    /**
+     * Text-to-speech state. True from the moment synthesis starts until playback ends,
+     * so the UI shows the ASCII animation for the whole wait rather than only while
+     * audio is actually coming out.
+     */
+    private val _speaking = MutableStateFlow(false)
+    val speaking: StateFlow<Boolean> = _speaking.asStateFlow()
+
+    private var player: android.media.MediaPlayer? = null
+
+    /** Reads [text] aloud with the LFM3-Audio model. Toggles off if already speaking. */
+    fun speak(text: String) {
+        if (text.isBlank()) return
+        if (_speaking.value) { stopSpeaking(); return }
+        viewModelScope.launch {
+            _speaking.value = true
+            try {
+                val model = ModelCatalog.assets
+                    .firstOrNull { it.kind == AssetKind.AUDIO_MODEL }
+                    ?.let { downloader.fileFor(it) }
+                val mmproj = ModelCatalog.assets
+                    .firstOrNull { it.kind == AssetKind.AUDIO_MMPROJ }
+                    ?.let { downloader.fileFor(it) }
+                if (model == null || mmproj == null || !model.exists() || !mmproj.exists()) {
+                    setError("Speech needs the LFM3-Audio model - download it in the Models tab.")
+                    return@launch
+                }
+                val speech = com.prismml.bonsaidroid.engine.TtsEngine.speak(
+                    context = ctx, text = text, model = model, mmproj = mmproj,
+                ).getOrElse { t ->
+                    setError("Speech failed: ${t.message}")
+                    return@launch
+                }
+                com.prismml.bonsaidroid.engine.TtsEngine.cleanup(ctx)
+                playWav(speech.wav)
+            } finally {
+                _speaking.value = false
+            }
+        }
+    }
+
+    private suspend fun playWav(wav: java.io.File) = withContext(Dispatchers.IO) {
+        runCatching {
+            player?.release()
+            val p = android.media.MediaPlayer()
+            p.setDataSource(wav.absolutePath)
+            p.setOnCompletionListener { mp -> mp.release(); if (player === mp) player = null }
+            p.prepare()
+            p.start()
+            player = p
+            // Hold "speaking" until playback really ends, so the animation tracks audio.
+            while (player != null && runCatching { p.isPlaying }.getOrDefault(false)) {
+                delay(120)
+            }
+        }.onFailure { setError("Playback failed: ${it.message}") }
+    }
+
+    fun stopSpeaking() {
+        runCatching { player?.stop(); player?.release() }
+        player = null
+        _speaking.value = false
+    }
+
 
     /**
      * Fire-and-forget restart for the UI. It must swallow failures: viewModelScope

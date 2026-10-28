@@ -2,7 +2,7 @@ package com.prismml.bonsaidroid.data
 
 import kotlinx.serialization.Serializable
 
-enum class AssetKind { TARGET_MODEL, DRAFT_MODEL, MMPROJ }
+enum class AssetKind { TARGET_MODEL, DRAFT_MODEL, MMPROJ, AUDIO_MODEL, AUDIO_MMPROJ }
 
 @Serializable
 data class ModelAsset(
@@ -62,6 +62,13 @@ object ModelCatalog {
 
     private const val LFM3 = "LFM3-1.7B-QAD-Q4_0.gguf"
 
+    private const val REPO_AUDIO =
+        "https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF/resolve/main"
+
+    private const val AUDIO = "LFM3-Audio-2B-Q4_0.gguf"
+
+    private const val AUDIO_MMPROJ = "mmproj-LFM3-Audio-2B-Q8_0.gguf"
+
     val assets: List<ModelAsset> = listOf(
         ModelAsset(
             id = "lfm25-qad-q4_0",
@@ -99,6 +106,40 @@ object ModelCatalog {
                 "agent harnesses, so it is the better pick for tool use; the 24B " +
                 "still answers better on open-ended questions.",
             sha256 = "43a7d09a0e9cba91b63eb7052488b9564569bddfd65754d2e426465e572a7452",
+        ),
+        /**
+         * Text-to-speech. A different job from the two chat models above: this one
+         * does not answer questions, it speaks text aloud.
+         *
+         * Needs BOTH files. The backbone is the language side; the mmproj carries the
+         * audio encoder (for ASR), the depthformer and the codec decoder that actually
+         * produces the waveform, so without it there is no audio at all.
+         *
+         * Driven by llama.cpp's `llama-tts` tool rather than the server, one process per
+         * utterance. 19 languages, female/male voice, no voice cloning. Sampling is
+         * fixed by the model card (temp 1.0, top-k 128, repeat-penalty 1.1) so the usual
+         * sampler settings do not apply.
+         */
+        ModelAsset(
+            id = "lfm3-audio-2b-q4_0",
+            kind = AssetKind.AUDIO_MODEL,
+            fileName = AUDIO,
+            url = "$REPO_AUDIO/$AUDIO",
+            sizeBytes = 1_049_613_856L,
+            summary = "LFM3-Audio-2B Q4_0 - text-to-speech, 19 languages, ~1 GB. " +
+                "Speaks replies aloud on-device. Needs its companion mmproj file " +
+                "below; without that there is no audio.",
+            sha256 = "112e4acb79be79dcd8df5749495614817e51c064cd9ca576aead02b64b2b7584",
+        ),
+        ModelAsset(
+            id = "lfm3-audio-2b-mmproj",
+            kind = AssetKind.AUDIO_MMPROJ,
+            fileName = AUDIO_MMPROJ,
+            url = "$REPO_AUDIO/$AUDIO_MMPROJ",
+            sizeBytes = 337_862_080L,
+            summary = "Audio projector for LFM3-Audio-2B - holds the codec decoder that " +
+                "turns the model's frames into a waveform. Required for speech.",
+            sha256 = "26601e904245a85bd8f3cf320a629e897cfc01c1d09369e8b4fd951f13024d3e",
         ),
     )
 }
