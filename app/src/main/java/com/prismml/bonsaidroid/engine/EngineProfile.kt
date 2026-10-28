@@ -60,10 +60,22 @@ data class EngineProfile(
     val reasoningEffort: String = "medium",
     val seed: Long = -1L,
     /** Runtime hygiene */
-    // mlock keeps weight pages resident so decode never refaults through
-    // FUSE storage. If RLIMIT_MEMLOCK blocks it the server warns and
-    // continues unlocked, so default-on is strictly better than off.
-    val mlockWeights: Boolean = false,
+    /**
+     * llama-server `--load-mode` (`-lm`): auto | none | mmap | mlock | mmap+mlock.
+     *
+     * **`none` is the right default for this fork.** LFM2.5 is 12.64 GiB and the
+     * phone has ~23 GB, so the whole model fits resident — and forcing it resident
+     * is both faster and far steadier than letting mmap demand-page it:
+     *
+     *   mmap (auto)  tg128 30.53 ± 4.21 t/s   <- pages get evicted under memory pressure
+     *   none         tg128 36.63 ± 0.35 t/s   <- +20% and 12x less variance
+     *   (pp128 96.52 vs 78.88)
+     *
+     * Both measured on the RedMagic with the app foregrounded (governor `walt`)
+     * and `--cpu-mask 0xff --cpu-strict 1`. Note `mlock` is NOT the same thing:
+     * it needs RLIMIT_MEMLOCK, which Android caps at 64 KB for a shell process.
+     */
+    val loadMode: String = "none",
     val noWarmup: Boolean = false,
     /** Expose the local server on Wi-Fi (LAN serving mode). */
     val exposeOnWifi: Boolean = false,

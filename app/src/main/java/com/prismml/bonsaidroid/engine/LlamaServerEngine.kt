@@ -459,10 +459,12 @@ class LlamaServerEngine(private val context: Context) : BonsaiEngine {
             }
         }
         if (p.pollPercent >= 0) args += listOf("--poll", p.pollPercent.toString())
-        // --mlock was replaced upstream by --load-mode. Note mlock is wrong for
-        // this model anyway: locking 66 GB of weights against 23 GB of RAM cannot
-        // succeed, so it is off by default.
-        if (p.mlockWeights) args += listOf("--load-mode", "mlock")
+        // --load-mode replaced the old --mlock flag upstream. See EngineProfile.loadMode:
+        // this fork defaults to "none" (fully resident), which measured +20% decode and
+        // 12x less variance than mmap for a model that fits in RAM.
+        if (p.loadMode.isNotEmpty() && p.loadMode != "auto") {
+            args += listOf("--load-mode", p.loadMode)
+        }
         if (p.noWarmup) args += "--no-warmup"
 
         // MTP: the head is grafted into the target GGUF, so the fork builds the
