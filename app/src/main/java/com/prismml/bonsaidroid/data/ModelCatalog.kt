@@ -57,6 +57,11 @@ object ModelCatalog {
 
     private const val QAD = "LFM2.5-24B-A2B-QAD-Q4_0.gguf"
 
+    private const val REPO_LFM3 =
+        "https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/main"
+
+    private const val LFM3 = "LFM3-1.7B-QAD-Q4_0.gguf"
+
     val assets: List<ModelAsset> = listOf(
         ModelAsset(
             id = "lfm25-qad-q4_0",
@@ -66,9 +71,34 @@ object ModelCatalog {
             sizeBytes = 13_578_190_880L,
             summary = "LFM2.5-24B-A2B QAD Q4_0 - 24B MoE, 2B active per token. " +
                 "Quantization-Aware Distillation Q4_0 recovers the perplexity " +
-                "lost to plain Q4_0. 13.58 GB fits fully in RAM, where decode " +
-                "measures ~25 t/s on the Snapdragon 8 Elite.",
+                "lost to plain Q4_0. 13.58 GB fits fully in RAM; measured 35.8 t/s " +
+                "decode / 106.7 t/s prefill on the Snapdragon 8 Elite (with the " +
+                "OEM performance mode granted). Best answer quality of the two.",
             sha256 = "d1c03f73ecaf61017d70419eec9e5dc0b05d50ae26c23d522829b934fbabf8a5",
+        ),
+        /**
+         * The faster sibling, and the better base for tool use.
+         *
+         * Arch key `lfm3` (Tri-Hybrid: gated short convolutions + sliding-window
+         * attention + global attention) - it needs the engine rebuilt at llama.cpp
+         * 8642541 or later; the earlier e86f5fd build does not know `lfm3` at all.
+         *
+         * Measured on the same phone, same flags: 43.5 t/s decode and 228.8 t/s
+         * prefill, against the 24B's 35.8 / 106.7 - faster while being 13x smaller,
+         * and it leaves ~12 GB of RAM free for context. 256k context window.
+         */
+        ModelAsset(
+            id = "lfm3-1.7b-qad-q4_0",
+            kind = AssetKind.TARGET_MODEL,
+            fileName = LFM3,
+            url = "$REPO_LFM3/$LFM3",
+            sizeBytes = 1_049_615_680L,
+            summary = "LFM3-1.7B QAD Q4_0 - 1.7B Tri-Hybrid, 256k context, only " +
+                "993 MiB. Measured 43.5 t/s decode / 228.8 t/s prefill here - " +
+                "faster than the 24B and 13x smaller. Liquid trained it inside " +
+                "agent harnesses, so it is the better pick for tool use; the 24B " +
+                "still answers better on open-ended questions.",
+            sha256 = "43a7d09a0e9cba91b63eb7052488b9564569bddfd65754d2e426465e572a7452",
         ),
     )
 }
