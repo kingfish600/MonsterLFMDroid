@@ -399,7 +399,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 var round = 0
                 while (true) {
                     var calls: List<com.prismml.bonsaidroid.engine.ToolCall>? = null
-                    engine.streamChat(convo, prof, tools = tools).collect { ev ->
+                    // On the final round, withhold the tools entirely. Otherwise the
+                    // model happily searches forever - observed in practice: four
+                    // near-identical queries ("newest iPhone model 2025", "latest
+                    // iPhone release 2025", "iPhone 16", "Apple iPhone latest model")
+                    // and then the cap fired with no answer given. Removing the tools
+                    // leaves it no option but to answer from what it already has.
+                    val roundTools = if (round >= MAX_TOOL_ROUNDS - 1) emptyList() else tools
+                    engine.streamChat(convo, prof, tools = roundTools).collect { ev ->
                         when (ev) {
                             is CompletionEvent.Token -> {
                                 pendingContent.append(ev.text); maybeFlush()
@@ -414,10 +421,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     flushPending()
                     val requested = calls ?: break
-                    if (round++ >= MAX_TOOL_ROUNDS) {
-                        setError("Stopped after $MAX_TOOL_ROUNDS tool rounds.")
-                        break
-                    }
+                    if (round++ >= MAX_TOOL_ROUNDS - 1) break
                     // Echo the request back, then supply each result.
                     convo += ChatMessage(
                         role = "assistant",
@@ -678,9 +682,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         const val DEFAULT_SYSTEM_PROMPT =
             "You are LFM2.5-24B-A2B running locally on an Android phone. " +
                 "Be concise unless asked for depth. " +
-                "You have a web_search tool: use it whenever the answer depends on " +
-                "facts you are not certain of, or on anything recent. Cite the URLs " +
-                "you actually used. If a search returns nothing useful, say so " +
-                "rather than guessing."
+                "You have a web_search tool. Use it for facts you are unsure of or " +
+                "anything recent - but search at most twice, then answer with what " +
+                "you have. Do not repeat the same query with slight rewording. " +
+                "Cite the URLs you actually used. If a search returns nothing " +
+                "useful, say so rather than guessing."
     }
 }

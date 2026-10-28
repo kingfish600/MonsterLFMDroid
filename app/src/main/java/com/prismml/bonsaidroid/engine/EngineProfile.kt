@@ -76,19 +76,26 @@ data class EngineProfile(
     /**
      * llama-server `--load-mode` (`-lm`): auto | none | mmap | mlock | mmap+mlock.
      *
-     * **`none` is the right default for this fork.** LFM2.5 is 12.64 GiB and the
-     * phone has ~23 GB, so the whole model fits resident — and forcing it resident
-     * is both faster and far steadier than letting mmap demand-page it:
+     * **`mmap` is the default, and that is a reliability decision, not a speed one.**
      *
-     *   mmap (auto)  tg128 30.53 ± 4.21 t/s   <- pages get evicted under memory pressure
-     *   none         tg128 36.63 ± 0.35 t/s   <- +20% and 12x less variance
-     *   (pp128 96.52 vs 78.88)
+     * `none` is genuinely faster when the phone is quiet — it loads the weights into
+     * *anonymous* memory and measured 36.63 ± 0.35 t/s against mmap's 30.53 ± 4.21.
+     * But anonymous memory cannot be reclaimed without swapping, and on a 24 GB phone
+     * with 12.58 GB of swap already exhausted, that makes this process the largest
+     * killable object on the device. Observed twice, reproducibly:
      *
-     * Both measured on the RedMagic with the app foregrounded (governor `walt`)
-     * and `--cpu-mask 0xff --cpu-strict 1`. Note `mlock` is NOT the same thing:
-     * it needs RLIMIT_MEMLOCK, which Android caps at 64 KB for a shell process.
+     *     llama-server exited (code=137)      <- SIGKILL, low-memory killer
+     *
+     * An app whose model dies mid-conversation is not usable, so the 20% is not worth
+     * it. With `mmap` the weights are file-backed **clean** pages: under pressure the
+     * kernel simply drops them and re-reads from flash, which costs speed but never
+     * kills the process. Slower beats dead.
+     *
+     * Note `mlock` is NOT an option: it needs RLIMIT_MEMLOCK, which Android caps at
+     * 64 KB for a non-root process (the engine only reads the limit; it does not raise
+     * it).
      */
-    val loadMode: String = "none",
+    val loadMode: String = "mmap",
     val noWarmup: Boolean = false,
     /** Expose the local server on Wi-Fi (LAN serving mode). */
     val exposeOnWifi: Boolean = false,
