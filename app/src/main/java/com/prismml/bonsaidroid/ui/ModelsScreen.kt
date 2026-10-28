@@ -43,6 +43,7 @@ private const val MB: Long = 1L shl 20
 
 /** One-tap shareable diagnostic bundle — paste into chat instead of OCR'ing screenshots. */
 private fun diagnosticBundle(
+    context: android.content.Context,
     state: com.prismml.bonsaidroid.engine.EngineStatus,
     loaded: AppViewModel.Loaded?,
     error: String?,
@@ -54,6 +55,7 @@ private fun diagnosticBundle(
         "build: v${com.prismml.bonsaidroid.BuildConfig.VERSION_NAME} " +
             "(${com.prismml.bonsaidroid.BuildConfig.VERSION_CODE})"
     )
+    appendLine(com.prismml.bonsaidroid.engine.PerfMode.describe(context))
     appendLine("engine_state: ${state.state}  elapsed=${state.elapsedSec}s")
     appendLine("detail: ${state.detail ?: "-"}")
     appendLine("loaded: ${loaded?.target?.fileName ?: "-"}" +
@@ -74,6 +76,7 @@ fun ModelsScreen(vm: AppViewModel) {
     val fallbackNote by vm.fallbackNote.collectAsState()
 
     val clipboard = LocalClipboardManager.current
+    val context = androidx.compose.ui.platform.LocalContext.current
     var copiedTick by remember { mutableStateOf(0L) }
     LaunchedEffect(copiedTick) {
         if (copiedTick > 0) { kotlinx.coroutines.delay(1500); copiedTick = 0 }
@@ -110,8 +113,8 @@ fun ModelsScreen(vm: AppViewModel) {
                         }
                         IconButton(onClick = {
                             clipboard.setText(AnnotatedString(diagnosticBundle(
-                                state = engineStatus, loaded = loaded, error = error,
-                                fallback = fallbackNote, logs = logs,
+                                context = context, state = engineStatus, loaded = loaded,
+                                error = error, fallback = fallbackNote, logs = logs,
                             )))
                             copiedTick = System.currentTimeMillis()
                         }) {
@@ -136,6 +139,20 @@ fun ModelsScreen(vm: AppViewModel) {
                             if (busy) "working\u2026" else "idle \u2014 pick a pack below and load"
                     }
                     Text(statusLine, style = MaterialTheme.typography.bodySmall)
+                    // The OEM per-app performance mode is worth ~50% of decode speed
+                    // and is completely invisible without this: an unlisted app never
+                    // gets the prime cores boosted (measured 24.1 -> 35.9 t/s).
+                    val boosted = remember {
+                        com.prismml.bonsaidroid.engine.PerfMode.isBoosted(context)
+                    }
+                    if (boosted == false) {
+                        Text(
+                            "\u26a0 This app is not in the phone's performance mode \u2014 " +
+                                "add it in Game Space for ~50% more speed.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
                     fallbackNote?.let {
                         Text(it, color = MaterialTheme.colorScheme.tertiary,
                             style = MaterialTheme.typography.bodySmall)
