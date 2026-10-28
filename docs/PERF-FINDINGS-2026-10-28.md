@@ -253,3 +253,21 @@ settings get global NubiaperformanceMode
 `WRITE_SECURE_SETTINGS`, so it may work) and re-measuring; alternatively the user
 can add the app through RedMagic's Game Space UI, which is the supported path and
 less likely to be overwritten.
+
+## Vision: waiting on upstream (tracked, not abandoned)
+The user wants image/document input "as soon as there is an upstream fix" and reports
+that reviewers' demos look responsive, which matches: this is our build, not the model.
+
+State of it:
+- `LFM3-VL-2B` (0.98 GiB) + `mmproj-LFM3-VL-2B-Q8_0.gguf` (0.19 GiB) **load fine** on
+  the rebuilt engine — `loaded multimodal model, 'mmproj-...'` — and genuinely process
+  an image (a 448x448 document produced 226 prompt tokens).
+- But decode is **3.7 t/s with the tower, 5.7 t/s without it**, against 43.5 t/s for
+  the same-size LFM3-1.7B text model. Since it is slow *without* an image too, this is
+  in `src/models/lfm3.cpp` or its vision path, not something tunable from the app.
+- **What to watch:** upstream `ggml-org/llama.cpp` commits touching `lfm3.cpp`,
+  `mtmd`, or LFM3-VL. When the text-side path speeds up, re-test with:
+  `llama-server -m LFM3-VL-2B-QAD-Q4_0.gguf --mmproj mmproj-LFM3-VL-2B-Q8_0.gguf ...`
+  and compare `predicted_per_second` against the 43.5 t/s text baseline. The models are
+  already on the host and the engine already supports the arch, so re-testing is
+  minutes of work once upstream lands a fix.
