@@ -354,6 +354,33 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             _generating.value = true
             // ADPF: hold boost for the whole generation (no-op below API 33).
             com.prismml.bonsaidroid.engine.PerfHint.acquire(ctx)
+
+            // UI throttle. The streaming path appends to the turn list once per
+            // token, and every append is a full Compose recomposition plus an O(n)
+            // string rebuild of the answer so far. At the speeds this model now
+            // reaches (~37 t/s) that is 37 recompositions/second and a quadratic
+            // rebuild, and the UI thread competes with the engine for the same
+            // cores. Measured cost: ~29.7 t/s rendered in the UI vs 36.96 t/s when
+            // the identical server is driven directly. Buffer and flush at ~12 Hz
+            // instead - visually identical, and the CPU goes back to the model.
+            val pendingContent = StringBuilder()
+            val pendingReasoning = StringBuilder()
+            var lastFlushMs = 0L
+            fun flushPending() {
+                if (pendingContent.isNotEmpty()) {
+                    appendToLastAssistant(pendingContent.toString())
+                    pendingContent.setLength(0)
+                }
+                if (pendingReasoning.isNotEmpty()) {
+                    appendReasoningToLast(pendingReasoning.toString())
+                    pendingReasoning.setLength(0)
+                }
+                lastFlushMs = System.currentTimeMillis()
+            }
+            fun maybeFlush() {
+                if (System.currentTimeMillis() - lastFlushMs >= 80) flushPending()
+            }
+
             try {
                 val apiMessages = buildList {
                     add(ChatMessage("system", systemPrompt))
@@ -361,12 +388,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 engine.streamChat(apiMessages, prof).collect { ev ->
                     when (ev) {
-                        is CompletionEvent.Token -> appendToLastAssistant(ev.text)
-                        is CompletionEvent.Reasoning -> appendReasoningToLast(ev.text)
+                        is CompletionEvent.Token -> {
+                            pendingContent.append(ev.text); maybeFlush()
+                        }
+                        is CompletionEvent.Reasoning -> {
+                            pendingReasoning.append(ev.text); maybeFlush()
+                        }
                         is CompletionEvent.Error -> setError(ev.message)
                         else -> Unit
                     }
                 }
+                flushPending()
                 // Silent-empty completion = classic GPU numeric fault signature
                 // (instant-EOS from corrupted logits). Never look like a reply.
                 if (_profile.value.nGpuLayers > 0 && !lastAssistantProduced()) {
@@ -378,8 +410,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 chats.append(sid, ChatTurn("assistant", lastAssistantText()))
             } catch (_: kotlinx.coroutines.CancellationException) {
                 // Stopped by user: keep and persist the partial answer.
+                flushPending()
                 chats.append(sid, ChatTurn("assistant", lastAssistantText()))
             } catch (t: Throwable) {
+                flushPending()
                 setError(t.message ?: t.javaClass.simpleName)
                 val partial = lastAssistantText()
                 if (partial.isNotBlank()) chats.append(sid, ChatTurn("assistant", partial))

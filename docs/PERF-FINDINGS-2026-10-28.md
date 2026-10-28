@@ -176,6 +176,36 @@ the load mode — killing the stale server restored swap instantly.
 Note the pressure test also shows `none` is robust: 10 GB of competing page cache
 cost it 0.17 t/s (36.15 → 35.98).
 
+## In-app vs server: the gap explained, and a UI fix
+The app reported ~29 t/s while the same server, driven directly with curl, gave
+**36.9 t/s**. Chasing that:
+
+| condition | decode |
+|---|---|
+| app's server, fresh short prompt (direct curl) | **36.87 t/s** |
+| same server, 1223-token context | **32.42 t/s** (−12%) |
+| through the app UI, real conversation | **30.9 t/s** (−5% more) |
+
+So most of the gap is **context length, which is inherent** — decode genuinely
+costs more with a long KV. Only ~5% was the UI.
+
+**The UI cost was real though, and fixable.** `AppViewModel` appended to the turn
+list once per token, and each append is a full Compose recomposition *plus* an
+O(n) string rebuild of the answer so far — at 37 t/s that is 37 recompositions per
+second and a quadratic rebuild, competing with the engine for the same cores. Now
+buffered and flushed at ~12 Hz (`AppViewModel.startGeneration`). Visually
+identical, verified rendering complete (answer, thinking block and t/s all present),
+and it recovered ~1.2 t/s of the UI's share.
+
+Also observed while measuring: during UI-driven generation the prime core sat at
+1017 MHz (its minimum) for the entire run, whereas a direct curl to the same server
+pushed cpu6 to 3513 MHz. Likely cause is UI backpressure — the app reads the
+stream slowly, the server blocks on its socket, and the governor sees intermittent
+rather than sustained load, so it never ramps. That is consistent with the throttle
+helping, and suggests further UI-side optimisation would buy a little more. Not
+pursued further; the remaining gain is small and the app is now close to what the
+hardware does with a realistic context.
+
 ## Negative result: `--cache-ram` is innocent
 The in-app/shell gap looked like the app's `--cache-ram 24576` (a 24 GB prompt
 cache). An interleaved A/B — alternating arms so drift hits both equally — says no:
