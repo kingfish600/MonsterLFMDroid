@@ -27,6 +27,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.floatOrNull
 import kotlinx.serialization.json.intOrNull
@@ -277,6 +278,7 @@ class LlamaServerEngine(private val context: Context) : BonsaiEngine {
         maxTokens: Int,
         temperature: Float,
         stop: List<String>,
+        tools: List<String>,
     ): Flow<CompletionEvent> = flow {
         // Timings are per-request. Without clearing, a response carrying no
         // "timings" field reuses the PREVIOUS request's - so an unspeculative run
@@ -293,8 +295,22 @@ class LlamaServerEngine(private val context: Context) : BonsaiEngine {
                 buildJsonObject {
                     put("role", it.role)
                     put("content", it.content)
+                    // Required on "tool" role messages so the server can match a result
+                    // back to the call that produced it.
+                    it.toolCallId?.let { id -> put("tool_call_id", id) }
+                    // Echo the assistant's own tool request back, or the server treats
+                    // the following "tool" messages as orphans.
+                    it.toolCallsJson?.let { tc ->
+                        runCatching { put("tool_calls", kotlinx.serialization.json.Json.parseToJsonElement(tc)) }
+                    }
                 }
             }))
+            // Tool calling. Schemas are raw JSON objects; the model's own template
+            // renders them (it uses <|tool_call_start|>[func(arg=value)]<|tool_call_end|>).
+            if (tools.isNotEmpty()) {
+                put("tools", JsonArray(tools.map { kotlinx.serialization.json.Json.parseToJsonElement(it) }))
+                put("tool_choice", "auto")
+            }
             put("stream", true)
             put("max_tokens", budget)
             put("temperature", temperature.toDouble())
@@ -329,6 +345,9 @@ class LlamaServerEngine(private val context: Context) : BonsaiEngine {
         var slotId: String? = null
         val sb = StringBuilder()
         val rb = StringBuilder()
+        // Tool-call fragments, keyed by the index the server assigns. Sorted so the
+        // calls come out in the order the model emitted them.
+        val toolAcc = sortedMapOf<Int, ToolCallBuilder>()
 
         call.execute().use { resp ->
             check(resp.isSuccessful) { "chat request failed: HTTP ${resp.code}" }
@@ -369,6 +388,36 @@ class LlamaServerEngine(private val context: Context) : BonsaiEngine {
                             rb.append(r.content); emit(CompletionEvent.Reasoning(r.content))
                         }
 
+                        // Tool calls stream as deltas too: the id and function name
+                        // arrive once, then `arguments` is delivered in fragments that
+                        // must be concatenated by index. Assembling them here rather
+                        // than in the caller keeps the streaming contract in one place.
+                        delta["tool_calls"]?.let { tc ->
+                            if (tc is JsonArray) {
+                                for (el in tc) {
+                                    val o = el as? JsonObject ?: continue
+                                    val idx = (o["index"] as? JsonPrimitive)?.content?.toIntOrNull()
+                                        ?: toolAcc.size
+                                    val fn = o["function"] as? JsonObject
+                                    val cur = toolAcc.getOrPut(idx) {
+                                        ToolCallBuilder(
+                                            id = (o["id"] as? JsonPrimitive)?.content ?: "",
+                                            name = (fn?.get("name") as? JsonPrimitive)?.content ?: "",
+                                        )
+                                    }
+                                    if (cur.id.isEmpty()) {
+                                        (o["id"] as? JsonPrimitive)?.content?.let { cur.id = it }
+                                    }
+                                    (fn?.get("name") as? JsonPrimitive)?.content?.let {
+                                        if (it.isNotEmpty()) cur.name = it
+                                    }
+                                    (fn?.get("arguments") as? JsonPrimitive)?.content?.let {
+                                        cur.args.append(it)
+                                    }
+                                }
+                            }
+                        }
+
                         obj["timings"]?.let { t ->
                             parseTimings(t).let { _lastTimings.value = it }
                         }
@@ -378,6 +427,14 @@ class LlamaServerEngine(private val context: Context) : BonsaiEngine {
             }
         }
         _activeSlot.value = null
+        // Surface requested tool calls BEFORE Done: the caller decides whether to
+        // execute them and re-enter, or treat this as a finished turn.
+        if (toolAcc.isNotEmpty()) {
+            val calls = toolAcc.values
+                .filter { it.name.isNotBlank() }
+                .map { ToolCall(id = it.id.ifBlank { it.name }, name = it.name, arguments = it.args.toString()) }
+            if (calls.isNotEmpty()) emit(CompletionEvent.ToolCalls(calls))
+        }
         emit(
             CompletionEvent.Done(
                 fullText = sb.toString(),
@@ -660,6 +717,13 @@ class LlamaServerEngine(private val context: Context) : BonsaiEngine {
     }
 
     private fun findFreePort(): Int = ServerSocket(0).use { it.localPort }
+
+    /** Mutable accumulator for one streamed tool call (arguments arrive fragmented). */
+    private class ToolCallBuilder(
+        var id: String,
+        var name: String,
+        val args: StringBuilder = StringBuilder(),
+    )
 
     companion object {
         private const val TAG = "BonsaiDroid"

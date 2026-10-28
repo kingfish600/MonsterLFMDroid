@@ -386,19 +386,55 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     add(ChatMessage("system", systemPrompt))
                     addAll(_turns.value.dropLast(1).map { ChatMessage(it.role, it.content) })
                 }
-                engine.streamChat(apiMessages, prof).collect { ev ->
-                    when (ev) {
-                        is CompletionEvent.Token -> {
-                            pendingContent.append(ev.text); maybeFlush()
+                // ---- agent loop -------------------------------------------------
+                // The model may answer, or ask to call tools. On a tool call we run it,
+                // append the assistant's own request plus the result, and go round
+                // again. MAX_TOOL_ROUNDS bounds it so a confused model cannot spin
+                // forever; every round also grows the context, and decode slows with
+                // context, so this is a cost control as much as a safety one.
+                val convo = apiMessages.toMutableList()
+                val tools = if (toolEnabled()) listOf(
+                    com.prismml.bonsaidroid.tools.WebSearch.schema()
+                ) else emptyList()
+                var round = 0
+                while (true) {
+                    var calls: List<com.prismml.bonsaidroid.engine.ToolCall>? = null
+                    engine.streamChat(convo, prof, tools = tools).collect { ev ->
+                        when (ev) {
+                            is CompletionEvent.Token -> {
+                                pendingContent.append(ev.text); maybeFlush()
+                            }
+                            is CompletionEvent.Reasoning -> {
+                                pendingReasoning.append(ev.text); maybeFlush()
+                            }
+                            is CompletionEvent.ToolCalls -> calls = ev.calls
+                            is CompletionEvent.Error -> setError(ev.message)
+                            else -> Unit
                         }
-                        is CompletionEvent.Reasoning -> {
-                            pendingReasoning.append(ev.text); maybeFlush()
-                        }
-                        is CompletionEvent.Error -> setError(ev.message)
-                        else -> Unit
+                    }
+                    flushPending()
+                    val requested = calls ?: break
+                    if (round++ >= MAX_TOOL_ROUNDS) {
+                        setError("Stopped after $MAX_TOOL_ROUNDS tool rounds.")
+                        break
+                    }
+                    // Echo the request back, then supply each result.
+                    convo += ChatMessage(
+                        role = "assistant",
+                        content = "",
+                        toolCallsJson = requested.joinToString(
+                            prefix = "[", postfix = "]", separator = ","
+                        ) { tc ->
+                            """{"id":${jsonStr(tc.id)},"type":"function","function":{""" +
+                                """"name":${jsonStr(tc.name)},"arguments":${jsonStr(tc.arguments)}}}"""
+                        },
+                    )
+                    for (tc in requested) {
+                        emitToolNote(tc)
+                        val result = runTool(tc)
+                        convo += ChatMessage(role = "tool", content = result, toolCallId = tc.id)
                     }
                 }
-                flushPending()
                 // Silent-empty completion = classic GPU numeric fault signature
                 // (instant-EOS from corrupted logits). Never look like a reply.
                 if (_profile.value.nGpuLayers > 0 && !lastAssistantProduced()) {
@@ -446,6 +482,53 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun lastAssistantText(): String =
         _turns.value.lastOrNull { it.role == "assistant" }?.content.orEmpty()
+
+    // ---- tools -------------------------------------------------------------
+
+    /** Web search is always available; a settings toggle can gate this later. */
+    private fun toolEnabled(): Boolean = true
+
+    private fun jsonStr(s: String): String = buildString {
+        append('"')
+        for (c in s) when (c) {
+            '"' -> append("\\\"")
+            '\\' -> append("\\\\")
+            '\n' -> append("\\n")
+            '\r' -> append("\\r")
+            '\t' -> append("\\t")
+            else -> if (c < ' ') append("\\u%04x".format(c.code)) else append(c)
+        }
+        append('"')
+    }
+
+    private fun toolArg(tc: com.prismml.bonsaidroid.engine.ToolCall, key: String): String? =
+        runCatching {
+            kotlinx.serialization.json.Json.parseToJsonElement(tc.arguments)
+                .let { it as kotlinx.serialization.json.JsonObject }[key]
+                ?.let { it as? kotlinx.serialization.json.JsonPrimitive }?.content
+        }.getOrNull()
+
+    /** Executes one requested tool. Never throws - failures become text for the model. */
+    private suspend fun runTool(tc: com.prismml.bonsaidroid.engine.ToolCall): String =
+        when (tc.name) {
+            "web_search" -> {
+                val q = toolArg(tc, "query").orEmpty()
+                if (q.isBlank()) {
+                    "Error: web_search needs a non-empty \"query\" string."
+                } else {
+                    com.prismml.bonsaidroid.tools.WebSearch.render(
+                        com.prismml.bonsaidroid.tools.WebSearch.search(q), q
+                    )
+                }
+            }
+            else -> "Error: unknown tool \"${tc.name}\"."
+        }
+
+    /** Makes tool activity visible in the transcript instead of a silent pause. */
+    private fun emitToolNote(tc: com.prismml.bonsaidroid.engine.ToolCall) {
+        val shown = toolArg(tc, "query") ?: tc.arguments.take(80)
+        appendToLastAssistant("\n\n[\uD83D\uDD0D ${tc.name}: $shown]\n\n")
+    }
 
     private fun lastAssistantProduced(): Boolean {
         val t = _turns.value.lastOrNull { it.role == "assistant" } ?: return false
@@ -585,8 +668,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     companion object {
+        /**
+         * Cap on tool round-trips per user message. Each round re-sends the whole
+         * conversation, and decode slows as context grows, so this bounds both a
+         * confused model and the cost of a long agent chain.
+         */
+        private const val MAX_TOOL_ROUNDS = 4
+
         const val DEFAULT_SYSTEM_PROMPT =
-            "You are LFM2.5-24B-A2B running fully offline on an Android phone. " +
-                "Be concise unless asked for depth."
+            "You are LFM2.5-24B-A2B running locally on an Android phone. " +
+                "Be concise unless asked for depth. " +
+                "You have a web_search tool: use it whenever the answer depends on " +
+                "facts you are not certain of, or on anything recent. Cite the URLs " +
+                "you actually used. If a search returns nothing useful, say so " +
+                "rather than guessing."
     }
 }
