@@ -552,7 +552,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     companion object {
         const val DEFAULT_SYSTEM_PROMPT =
-            "You are Qwen3.8-Flash-Next running fully offline on an Android phone. " +
+            "You are LFM2.5-24B-A2B running fully offline on an Android phone. " +
                 "Be concise unless asked for depth."
     }
 }

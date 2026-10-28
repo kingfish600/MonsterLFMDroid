@@ -151,7 +151,7 @@ fun ChatScreen(vm: AppViewModel) {
             if (turns.isEmpty()) {
                 item {
                     Text(
-                        "Qwen3.8-Flash-Next (176B MoE) runs entirely on this device.\n" +
+                        "LFM2.5-24B-A2B (24B MoE, 2B active) runs entirely on this device.\n" +
                             "Load a pack in the Models tab, then talk.\n\n" +
                             "Long prompts are processed on CPU; tap \"thinking\" on an " +
                             "answer to expand or collapse the reasoning trace.",
