@@ -149,6 +149,33 @@ root-caused to make the decision** — x86 says "no win", the phone says "unusab
 so speculation is out either way. The sidecar stays on the device at
 `/data/local/tmp/lfm/` if it is ever worth revisiting.
 
+## RESOLVED: `-lm none` is the right default, and it does NOT swap
+The concern was that `-lm none` puts 13 GiB in *anonymous* memory (swappable)
+while `mmap` leaves it file-backed (droppable) — so under memory pressure `none`
+might swap the model out and collapse. Measured directly, by loading each mode and
+then creating ~10 GB of page-cache pressure with `dd`:
+
+| | `-lm none` | `mmap` |
+|---|---|---|
+| swap free before load | 11.96 GB | 11.96 GB |
+| swap free after load | **11.96 GB (unchanged)** | **6.04 GB (−5.9 GB!)** |
+| clean decode | **36.15 t/s** | 30.71 t/s |
+| decode under 10 GB pressure | **35.98 t/s** | 35.64 t/s |
+| after unload | swap unchanged | recovering |
+
+The result is the opposite of the worry: **`none` never touched swap at all**,
+while `mmap` consumed 5.9 GB of it on load and was 5 t/s slower until its pages
+warmed (its *pressured* decode, 35.64, beats its own clean decode, 30.71 — i.e. the
+first tokens after a mmap load are the slow ones).
+
+So the shipped default is correct and should stay: `-lm none` is faster, steadier,
+and no worse a citizen. The earlier "swap filled to 832 kB" incident that motivated
+the worry was accumulated leftovers from repeated test servers plus other apps, not
+the load mode — killing the stale server restored swap instantly.
+
+Note the pressure test also shows `none` is robust: 10 GB of competing page cache
+cost it 0.17 t/s (36.15 → 35.98).
+
 ## Negative result: `--cache-ram` is innocent
 The in-app/shell gap looked like the app's `--cache-ram 24576` (a 24 GB prompt
 cache). An interleaved A/B — alternating arms so drift hits both equally — says no:
