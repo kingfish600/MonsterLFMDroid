@@ -49,13 +49,26 @@ data class EngineProfile(
     val noSpeculation: Boolean = false,
     /** Must equal the drafter's block size; smaller crashes per upstream docs. */
     val draftMax: Int = 4,
-    /** Sampling: thinking-mode set from the Bonsai-2 model card. */
-    val temperature: Float = 1.0f,
+    /**
+     * Sampling. These are NOT arbitrary and NOT inherited from the monster app -
+     * they are the values **the model itself declares** in its GGUF metadata:
+     *
+     *     general.sampling.temp           = 0.1
+     *     general.sampling.top_k          = 50
+     *     general.sampling.penalty_repeat = 1.05
+     *
+     * Liquid's release notes and independent testing agree (temp 0.1 / top-k 50 /
+     * repeat-penalty 1.05). The previous values here (temp 1.0, top-k 20, repeat 1.0)
+     * were tuned for the 176B Flash-Next model this fork was split from, and running
+     * a reasoning model at temperature 1.0 mostly buys variance and hallucination.
+     * top_p/min_p are left as they were; the model declares nothing for them.
+     */
+    val temperature: Float = 0.1f,
     val topP: Float = 0.95f,
-    val topK: Int = 20,
+    val topK: Int = 50,
     val minP: Float = 0.05f,
     val presencePenalty: Float = 0.0f,
-    val repetitionPenalty: Float = 1.0f,
+    val repetitionPenalty: Float = 1.05f,
     /** low|medium|xhigh (never "high" - HTTP 500). "" leaves the template default. */
     val reasoningEffort: String = "medium",
     val seed: Long = -1L,
