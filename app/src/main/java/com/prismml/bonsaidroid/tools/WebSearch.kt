@@ -1,109 +1,173 @@
 package com.prismml.bonsaidroid.tools
 
+import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import okhttp3.MediaType.Companion.toMediaType
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonObject
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
+import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
 /**
- * Web search tool — the first real tool for the agent loop.
+ * Web search tool.
  *
- * DuckDuckGo's **lite** endpoint, via POST. Verified working from the device class of
- * client: GET to the same host returns a page whose links are obfuscated behind
- * `uddg=` redirects, and the Instant Answer JSON API answers `202` with no body
- * (rate-limited). POSTing a form body to `https://lite.duckduckgo.com/lite/` returns
- * plain HTML with real results, so that is what this uses. No API key, no quota.
+ * **Why this no longer uses DuckDuckGo.** The original implementation scraped
+ * `lite.duckduckgo.com` with a POST, which worked when written. It stopped working
+ * shortly after: DDG began returning an "anomaly" challenge page (HTTP 202, ~14 KB,
+ * zero result anchors) for automated requests from this client, so the tool silently
+ * returned nothing and the model correctly reported finding no results. Verified
+ * against both `lite.` and `html.duckduckgo.com` — both blocked.
  *
- * Result size is deliberately small. An agent loop *accumulates* context and decode
- * speed falls off with it (measured ~31 t/s at 500 tokens, ~25 at 4K, ~15-17 at 8K),
- * so every tool result is a permanent tax on the rest of the conversation. We return
- * a handful of results with truncated snippets rather than a full page of text.
+ * **What it uses instead.** The user's own SearXNG instance, which is already running
+ * locally in Docker (host port 8093) with `formats: [html, json]` and, importantly,
+ * `limiter: false`. The phone reaches it over Tailscale, where it appears as
+ * 100.103.111.81. This is strictly better than a public endpoint: no rate limiting, no
+ * API key, no third party seeing the queries, and 20 results with real snippets.
+ *
+ * **Wikipedia fallback.** If SearXNG is unreachable — the common case being the phone
+ * off Tailscale or away from home — the tool falls back to the MediaWiki search API,
+ * which needs no key and is never blocked. Wikipedia alone is narrower than a web
+ * search, so the result text says which backend answered; the model is told to be
+ * honest about the difference rather than implying it searched the whole web.
  */
 object WebSearch {
 
-    private const val ENDPOINT = "https://lite.duckduckgo.com/lite/"
+    private const val TAG = "BonsaiDroid"
+
+    /** The user's SearXNG, over Tailscale. Change if the host address changes. */
+    private const val SEARX = "http://100.103.111.81:8093"
+
+    private const val WIKI = "https://en.wikipedia.org/w/api.php"
+
     private const val UA =
         "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36"
 
-    /** Keep snippets short — see the class comment about context cost. */
+    /** Keep snippets short: agent loops accumulate context and decode slows with it. */
     private const val MAX_SNIPPET = 240
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(25, TimeUnit.SECONDS)
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
         .build()
+
+    private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
     data class Result(val title: String, val url: String, val snippet: String)
 
-    private val LINK = Regex(
-        """<a[^>]+class=['"]result-link['"][^>]*href="([^"]+)"[^>]*>(.*?)</a>""",
-        setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE),
-    )
-    private val SNIPPET = Regex(
-        """<td[^>]+class=['"]result-snippet['"][^>]*>(.*?)</td>""",
-        setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE),
-    )
-    private val TAGS = Regex("""<[^>]+>""")
-    private val ENTITIES = mapOf(
-        "&amp;" to "&", "&lt;" to "<", "&gt;" to ">", "&quot;" to "\"",
-        "&#39;" to "'", "&apos;" to "'", "&nbsp;" to " ", "&hellip;" to "…",
-        "&mdash;" to "—", "&ndash;" to "–", "&#x27;" to "'",
+    /** Which backend actually answered, so the model can be honest about coverage. */
+    data class SearchOutcome(
+        val backend: String,
+        val results: List<Result>,
+        val error: String? = null,
     )
 
-    private fun clean(s: String): String {
-        var out = TAGS.replace(s, "")
-        for ((k, v) in ENTITIES) out = out.replace(k, v)
-        out = out.replace(Regex("""&#(\d+);""")) { m ->
-            m.groupValues[1].toIntOrNull()?.toChar()?.toString() ?: ""
-        }
-        return out.replace(Regex("""\s+"""), " ").trim()
+    // ---------------------------------------------------------------- SearXNG
+
+    private suspend fun searx(query: String, max: Int): List<Result>? = withContext(Dispatchers.IO) {
+        runCatching {
+            val url = "$SEARX/search?q=${URLEncoder.encode(query, "UTF-8")}&format=json"
+            val req = Request.Builder().url(url).header("User-Agent", UA)
+                .header("Accept", "application/json").get().build()
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    Log.i(TAG, "searx HTTP ${resp.code}")
+                    return@runCatching null
+                }
+                val body = resp.body?.string().orEmpty()
+                val root = json.parseToJsonElement(body).jsonObject
+                val arr = root["results"] as? JsonArray ?: return@runCatching null
+                arr.take(max).mapNotNull { el ->
+                    val o = el as? JsonObject ?: return@mapNotNull null
+                    val u = (o["url"] as? JsonPrimitive)?.content.orEmpty()
+                    if (!u.startsWith("http")) return@mapNotNull null
+                    Result(
+                        title = (o["title"] as? JsonPrimitive)?.content.orEmpty().take(140),
+                        url = u,
+                        snippet = (o["content"] as? JsonPrimitive)?.content.orEmpty()
+                            .replace(Regex("""\s+"""), " ").trim().take(MAX_SNIPPET),
+                    )
+                }
+            }
+        }.getOrNull()
     }
 
-    /** Runs the search. Never throws — a failed search returns empty, and the model is told so. */
-    suspend fun search(query: String, max: Int = 5): List<Result> = withContext(Dispatchers.IO) {
+    // -------------------------------------------------------------- Wikipedia
+
+    private suspend fun wikipedia(query: String, max: Int): List<Result>? = withContext(Dispatchers.IO) {
         runCatching {
-            val body = ("q=" + java.net.URLEncoder.encode(query, "UTF-8"))
-                .toRequestBody("application/x-www-form-urlencoded".toMediaType())
-            val req = Request.Builder()
-                .url(ENDPOINT)
-                .header("User-Agent", UA)
-                .header("Accept", "text/html")
-                .post(body)
-                .build()
+            val url = "$WIKI?action=query&list=search&srsearch=" +
+                URLEncoder.encode(query, "UTF-8") + "&format=json&srlimit=$max"
+            val req = Request.Builder().url(url).header("User-Agent", UA).get().build()
             client.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return@runCatching emptyList()
-                val html = resp.body?.string().orEmpty()
-                val links = LINK.findAll(html).toList()
-                val snippets = SNIPPET.findAll(html).map { clean(it.groupValues[1]) }.toList()
-                links.take(max).mapIndexed { i, m ->
-                    val url = m.groupValues[1]
+                if (!resp.isSuccessful) return@runCatching null
+                val body = resp.body?.string().orEmpty()
+                val root = json.parseToJsonElement(body).jsonObject
+                val hits = ((root["query"] as? JsonObject)?.get("search")) as? JsonArray
+                    ?: return@runCatching null
+                hits.mapNotNull { el ->
+                    val o = el as? JsonObject ?: return@mapNotNull null
+                    val title = (o["title"] as? JsonPrimitive)?.content.orEmpty()
+                    if (title.isBlank()) return@mapNotNull null
                     Result(
-                        title = clean(m.groupValues[2]).take(140),
-                        url = url,
-                        snippet = (snippets.getOrNull(i) ?: "").take(MAX_SNIPPET),
+                        title = title,
+                        url = "https://en.wikipedia.org/wiki/" +
+                            URLEncoder.encode(title.replace(' ', '_'), "UTF-8"),
+                        snippet = (o["snippet"] as? JsonPrimitive)?.content.orEmpty()
+                            .replace(Regex("""<[^>]+>"""), "")
+                            .replace("&quot;", "\"").replace("&amp;", "&")
+                            .replace(Regex("""\s+"""), " ").trim().take(MAX_SNIPPET),
                     )
-                }.filter { it.url.startsWith("http") }
+                }
             }
-        }.getOrDefault(emptyList())
+        }.getOrNull()
+    }
+
+    // ------------------------------------------------------------------ entry
+
+    /** Runs the search. Never throws; a total failure is reported as an error string. */
+    suspend fun searchOutcome(query: String, max: Int = 5): SearchOutcome {
+        searx(query, max)?.takeIf { it.isNotEmpty() }?.let {
+            Log.i(TAG, "web_search searx \"$query\" -> ${it.size} results")
+            return SearchOutcome("searxng", it)
+        }
+        Log.i(TAG, "web_search searx unavailable, trying wikipedia")
+        wikipedia(query, max)?.takeIf { it.isNotEmpty() }?.let {
+            Log.i(TAG, "web_search wikipedia \"$query\" -> ${it.size} results")
+            return SearchOutcome("wikipedia", it)
+        }
+        Log.i(TAG, "web_search FAILED \"$query\" - both backends empty")
+        return SearchOutcome(
+            "none", emptyList(),
+            error = "Search is unavailable right now (SearXNG unreachable and Wikipedia " +
+                "returned nothing). Tell the user you could not search rather than guessing.",
+        )
     }
 
     /** Compact text form handed back to the model as the tool result. */
-    fun render(results: List<Result>, query: String): String =
-        if (results.isEmpty()) {
-            "No results for \"$query\". The search endpoint returned nothing usable."
-        } else {
-            buildString {
-                appendLine("Search results for \"$query\":")
-                results.forEachIndexed { i, r ->
-                    appendLine("${i + 1}. ${r.title}")
-                    appendLine("   ${r.url}")
-                    if (r.snippet.isNotBlank()) appendLine("   ${r.snippet}")
-                }
-            }.trimEnd()
-        }
+    fun render(outcome: SearchOutcome, query: String): String = when {
+        outcome.error != null -> outcome.error
+        outcome.results.isEmpty() ->
+            "No results for \"$query\"."
+        else -> buildString {
+            appendLine(
+                if (outcome.backend == "wikipedia")
+                    "Wikipedia results for \"$query\" (Wikipedia only - this was a fallback, " +
+                        "not a full web search):"
+                else
+                    "Web search results for \"$query\":"
+            )
+            outcome.results.forEachIndexed { i, r ->
+                appendLine("${i + 1}. ${r.title}")
+                appendLine("   ${r.url}")
+                if (r.snippet.isNotBlank()) appendLine("   ${r.snippet}")
+            }
+        }.trimEnd()
+    }
 
     /** OpenAI-style function schema advertised to the model. */
     fun schema(): String = """

@@ -61,6 +61,19 @@ class ModelDownloader(context: Context) {
     private val _state = MutableStateFlow<DownloadState>(DownloadState.Idle)
     val state: StateFlow<DownloadState> = _state.asStateFlow()
 
+    /**
+     * Bumped whenever the set of files on disk changes.
+     *
+     * `isDownloaded()` reads the filesystem, so it is not observable by itself: after
+     * deleting a model the UI had no reason to recompose and the card stayed on screen
+     * looking untouched until the user switched tabs and back. Anything that renders
+     * downloaded state must collect this, or deletions are invisible.
+     */
+    private val _revision = MutableStateFlow(0)
+    val revision: StateFlow<Int> = _revision.asStateFlow()
+
+    private fun bumpRevision() { _revision.value = _revision.value + 1 }
+
     /** One download at a time — these are multi-GB files on a phone. */
     private val mutex = Mutex()
 
@@ -197,6 +210,8 @@ class ModelDownloader(context: Context) {
                 )
             )
             _state.value = DownloadState.Idle
+            // A new file exists now, so any "downloaded" UI must re-evaluate.
+            bumpRevision()
             dest
         }
 
@@ -214,6 +229,8 @@ class ModelDownloader(context: Context) {
             File(f.absolutePath + ".part").delete()
             File(f.absolutePath + ".meta.json").delete()
         }
+        // Tell the UI the disk changed, or the card stays visible looking untouched.
+        bumpRevision()
     }
 
     // ------------------------------------------------------------------ //

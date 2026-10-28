@@ -68,6 +68,11 @@ private fun diagnosticBundle(
 @Composable
 fun ModelsScreen(vm: AppViewModel) {
     val downloads by vm.downloadState.collectAsState()
+    // Collected purely so the screen recomposes when files are deleted or finished
+    // downloading: isDownloaded() reads the filesystem and is not observable itself,
+    // so without this a deleted model stayed on screen until a tab switch.
+    @Suppress("UNUSED_VARIABLE")
+    val diskRevision by vm.downloader.revision.collectAsState()
     val loaded by vm.loaded.collectAsState()
     val busy by vm.busy.collectAsState()
     val error by vm.error.collectAsState()
@@ -184,10 +189,17 @@ fun ModelsScreen(vm: AppViewModel) {
                             // decoding measured neutral here (64% acceptance, decode
                             // unchanged) and its head costs 2.8 GB of page cache, so the
                             // drafter is deliberately not passed.
-                            Text("Load")
+                            Text(
+                                if (engineStatus.state ==
+                                    com.prismml.bonsaidroid.engine.EngineState.STARTING
+                                ) "Loading…" else "Load"
+                            )
                         }
-                        OutlinedButton(enabled = loaded != null && !busy, onClick = { vm.unload() }) {
-                            Text("Unload")
+                        OutlinedButton(
+                            enabled = loaded != null && !busy,
+                            onClick = { vm.unload() },
+                        ) {
+                            Text(if (busy && loaded != null) "Unloading…" else "Unload")
                         }
                     }
                 }
@@ -198,6 +210,10 @@ fun ModelsScreen(vm: AppViewModel) {
             AssetCard(
                 asset = asset,
                 selected = asset.id == selectedTarget.id && asset.kind == AssetKind.TARGET_MODEL,
+                // Which model the engine is actually serving right now. Without this the
+                // card only showed "selected", so loading or switching models gave no
+                // feedback on the card itself.
+                loaded = loaded?.target?.id == asset.id,
                 downloaded = vm.downloader.isDownloaded(asset),
                 downloadState = downloads.takeIf { it is DownloadState.Running || it is DownloadState.Failed },
                 onSelect = { if (asset.kind == AssetKind.TARGET_MODEL) selectedTarget = asset },
@@ -213,6 +229,7 @@ fun ModelsScreen(vm: AppViewModel) {
 private fun AssetCard(
     asset: ModelAsset,
     selected: Boolean,
+    loaded: Boolean,
     downloaded: Boolean,
     downloadState: DownloadState?,
     onSelect: () -> Unit,
@@ -230,8 +247,15 @@ private fun AssetCard(
                     style = MaterialTheme.typography.labelMedium)
             }
             Text(
-                "${asset.summary} ${if (selected) "• selected" else ""}",
+                asset.summary +
+                    when {
+                        loaded -> "  ● LOADED"
+                        selected -> "  • selected"
+                        else -> ""
+                    },
                 style = MaterialTheme.typography.bodySmall,
+                color = if (loaded) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurface,
             )
             when {
                 running -> {

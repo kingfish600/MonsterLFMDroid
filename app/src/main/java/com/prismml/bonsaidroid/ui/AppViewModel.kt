@@ -551,13 +551,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     android.util.Log.i("BonsaiDroid", "tool web_search: EMPTY QUERY, args=${tc.arguments}")
                     "Error: web_search needs a non-empty \"query\" string."
                 } else {
-                    val hits = com.prismml.bonsaidroid.tools.WebSearch.search(q)
+                    val outcome = com.prismml.bonsaidroid.tools.WebSearch.searchOutcome(q)
                     android.util.Log.i(
                         "BonsaiDroid",
-                        "tool web_search q=\"$q\" -> ${hits.size} results" +
-                            (hits.firstOrNull()?.let { " first=${it.url.take(60)}" } ?: "")
+                        "tool web_search q=\"$q\" backend=${outcome.backend} " +
+                            "results=${outcome.results.size} err=${outcome.error ?: "-"}"
                     )
-                    com.prismml.bonsaidroid.tools.WebSearch.render(hits, q)
+                    com.prismml.bonsaidroid.tools.WebSearch.render(outcome, q)
                 }
             }
             else -> {
