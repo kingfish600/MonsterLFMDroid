@@ -42,8 +42,18 @@ Headline: **25.45 ± 1.33 t/s decode** (`-lm none`, t=8, all-core mask) vs
   `d1c03f73ecaf61017d70419eec9e5dc0b05d50ae26c23d522829b934fbabf8a5`,
   `hasMtp=false`, URL `huggingface.co/LiquidAI/LFM2.5-24B-A2B-GGUF/resolve/main/LFM2.5-24B-A2B-QAD-Q4_0.gguf`.
 - `LlamaServerEngine.kt`: cpu-mask `0x3f`→`0xff` (old mask excluded the 2×
-  4.32 GHz primes, −30% decode); `-ctxcp 0` deleted (flag removed upstream,
-  would crash startup).
+  4.32 GHz primes, −30% decode).
+- **`-ctxcp 0` restored (2026-10-27 late, commit on top of the original build).**
+  The earlier claim in this doc — "flag removed upstream, would crash startup" —
+  was **wrong**. `-ctxcp` is defined at `common/arg.cpp:1709`, takes an int, and
+  defaults to **32**; checkpoints are gated on `n_ctx_checkpoints > 0`
+  (`server-context.cpp:1594`). So `-ctxcp 0` validly disables them, which is what
+  the original app did on purpose — a checkpoint copies the whole KV mid-decode
+  and stutters a linear chat. Dropping it silently re-enabled 32 of them.
+  Settled empirically with the **x86 build of the same engine**
+  (`/mnt/nvme4tb/builds/x86/bin`): an unknown flag is rejected before the model
+  loads, so the app's exact argv with a fake `-m` path isolates parser errors.
+  With `-ctxcp 0` the parser accepts everything and fails only on the fake path.
 - `EngineProfile.kt`: presets `-t 6`→`-t 8`; `threadsBatch 8`→`0` (passing
   `-tb` silently defeats the cpu-mask — verified on device); SPEED `moeTopK`
   8→0 (BONSAI-only knob). `cacheRamMb` stays 24576 default (mmap-reclaimable,

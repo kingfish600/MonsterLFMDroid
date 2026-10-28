@@ -417,8 +417,15 @@ class LlamaServerEngine(private val context: Context) : BonsaiEngine {
             "--host", if (p.exposeOnWifi) "0.0.0.0" else "127.0.0.1",
             "--port", port.toString(),
             "-c", p.contextTokens.toString(),
-            // No -ctxcp: checkpointing was removed upstream at e86f5fd, and
-            // copying the whole KV mid-decode was a stutter source anyway.
+            // -ctxcp 0 disables context checkpoints (upstream default is 32;
+            // common/common.h n_ctx_checkpoints, gated at server-context.cpp:1594).
+            // A checkpoint copies the whole KV mid-decode - useless for a linear
+            // chat and a visible stutter source. Restored after this fork dropped
+            // it on a mistaken "removed upstream" note: the flag IS in e86f5fd and
+            // `-ctxcp 0` parses cleanly (verified against the x86 build of the same
+            // engine - the parser accepts the full argv and only fails on the model
+            // path).
+            "-ctxcp", "0",
             "-np", "1",
             "-fa", if (p.flashAttn) "on" else "off",
             "--cache-type-k", p.kvCacheTypeK,
