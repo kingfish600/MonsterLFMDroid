@@ -368,7 +368,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             var lastFlushMs = 0L
             fun flushPending() {
                 if (pendingContent.isNotEmpty()) {
-                    appendToLastAssistant(pendingContent.toString())
+                    appendToLastAssistant(sanitize(pendingContent.toString()))
                     pendingContent.setLength(0)
                 }
                 if (pendingReasoning.isNotEmpty()) {
@@ -404,9 +404,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     // near-identical queries ("newest iPhone model 2025", "latest
                     // iPhone release 2025", "iPhone 16", "Apple iPhone latest model")
                     // and then the cap fired with no answer given. Removing the tools
-                    // leaves it no option but to answer from what it already has.
-                    val roundTools = if (round >= MAX_TOOL_ROUNDS - 1) emptyList() else tools
-                    engine.streamChat(convo, prof, tools = roundTools).collect { ev ->
+                    // leaves it no option but to answer from what it already has, and
+                    // an explicit instruction stops it writing the call syntax as text.
+                    val finalRound = round >= MAX_TOOL_ROUNDS - 1
+                    val roundTools = if (finalRound) emptyList() else tools
+                    val roundConvo = if (finalRound) {
+                        convo + ChatMessage(
+                            "system",
+                            "Searching is no longer available. Answer the question now " +
+                                "using only the information already gathered above, and " +
+                                "cite the URLs you used.",
+                        )
+                    } else convo
+                    engine.streamChat(roundConvo, prof, tools = roundTools).collect { ev ->
                         when (ev) {
                             is CompletionEvent.Token -> {
                                 pendingContent.append(ev.text); maybeFlush()
@@ -492,6 +502,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** Web search is always available; a settings toggle can gate this later. */
     private fun toolEnabled(): Boolean = true
 
+    /**
+     * Strips raw tool-call syntax out of displayed text.
+     *
+     * The model emits `<|tool_call_start|>[func(arg=value)]<|tool_call_end|>`. When
+     * tools ARE offered the server parses that into a structured call and it never
+     * reaches us as content. But on the final round we deliberately withhold the
+     * tools to force an answer — and the model, trained to emit that syntax, will
+     * sometimes write it out as literal text instead. Observed live:
+     * `<|tool_call_start|>[web_search(query='Canberra')]<|tool_call_end|>` shown to
+     * the user as the entire "answer". Strip complete blocks, and any trailing
+     * unterminated one (which happens if the budget runs out mid-call).
+     */
+    private fun sanitize(text: String): String {
+        var out = text
+        out = out.replace(Regex("""<\|tool_call_start\|>.*?<\|tool_call_end\|>""", RegexOption.DOT_MATCHES_ALL), "")
+        out = out.replace(Regex("""<\|tool_call_start\|>.*$""", RegexOption.DOT_MATCHES_ALL), "")
+        out = out.replace("<|tool_call_end|>", "")
+        return out
+    }
+
     private fun jsonStr(s: String): String = buildString {
         append('"')
         for (c in s) when (c) {
@@ -518,14 +548,22 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             "web_search" -> {
                 val q = toolArg(tc, "query").orEmpty()
                 if (q.isBlank()) {
+                    android.util.Log.i("BonsaiDroid", "tool web_search: EMPTY QUERY, args=${tc.arguments}")
                     "Error: web_search needs a non-empty \"query\" string."
                 } else {
-                    com.prismml.bonsaidroid.tools.WebSearch.render(
-                        com.prismml.bonsaidroid.tools.WebSearch.search(q), q
+                    val hits = com.prismml.bonsaidroid.tools.WebSearch.search(q)
+                    android.util.Log.i(
+                        "BonsaiDroid",
+                        "tool web_search q=\"$q\" -> ${hits.size} results" +
+                            (hits.firstOrNull()?.let { " first=${it.url.take(60)}" } ?: "")
                     )
+                    com.prismml.bonsaidroid.tools.WebSearch.render(hits, q)
                 }
             }
-            else -> "Error: unknown tool \"${tc.name}\"."
+            else -> {
+                android.util.Log.i("BonsaiDroid", "tool unknown: ${tc.name}")
+                "Error: unknown tool \"${tc.name}\"."
+            }
         }
 
     /** Makes tool activity visible in the transcript instead of a silent pause. */
