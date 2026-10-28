@@ -119,6 +119,36 @@ This matches the project's only other speculation measurement (MTP on the monste
 complexity for a measured loss. Retained here because the phone's regime
 (bandwidth-bound) differs from x86 and deserved a direct check.
 
+### And on the phone it is catastrophic, not merely slower
+Same sidecar, same flags, on the device (boost active, baseline re-measured in the
+same run at **35.95 / 35.58 t/s**):
+
+| config | decode |
+|---|---|
+| baseline (no draft) | **35.9 t/s** |
+| `n_max=4 p_min=0.3` + DSpark | **0.35 t/s** |
+
+That is a **~100× slowdown**, not a few percent. The server log shows it grinding
+for 14 minutes to produce 143 tokens, with `tg_3s` oscillating between 0.13 and
+0.67 t/s. The drafter initialises correctly
+(`block_size=9, n_extract=5, sample_from_anchor=true`), so this is a runtime cost
+problem, not a load failure.
+
+Worth recording *why this is surprising*: the mechanism should be cheap. DSpark
+feeds the drafter `[id_last, <mask> × (block_size-1)]` and denoises the entire
+block in a **single** forward pass (5 layers), then the target verifies the block in
+one pass — so a round should cost ~1 drafter pass + 1 target pass for up to 9
+tokens. Nothing in that should be 100× slow.
+
+Not root-caused. Candidates, in order of suspicion: an op in the drafter's path
+falling back to a scalar/generic implementation on ARM; the
+`dflash requires ctx_other to be set` warning actually mattering at runtime (it
+appears on x86 too, where the same config only lost ~6%); or F16/F32
+cross-conversion in the shared embedding/LM head path. **It does not need to be
+root-caused to make the decision** — x86 says "no win", the phone says "unusable",
+so speculation is out either way. The sidecar stays on the device at
+`/data/local/tmp/lfm/` if it is ever worth revisiting.
+
 ## Negative result: `--cache-ram` is innocent
 The in-app/shell gap looked like the app's `--cache-ram 24576` (a 24 GB prompt
 cache). An interleaved A/B — alternating arms so drift hits both equally — says no:
