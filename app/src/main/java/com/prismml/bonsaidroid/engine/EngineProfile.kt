@@ -31,8 +31,22 @@ data class EngineProfile(
     val kvCacheTypeK: String = "q8_0",
     val kvCacheTypeV: String = "q8_0",
     val flashAttn: Boolean = true,
-    /** Prompt-cache RAM for single-user slot reuse (MiB). */
-    val cacheRamMb: Int = 24576,
+    /**
+     * Prompt-cache RAM for single-user slot reuse (MiB). Sent as `--cache-ram`.
+     *
+     * Upstream's own default is 8192. This fork had been setting **24576 — 24 GB on a
+     * 24 GB phone**, which is what kept exhausting swap and getting the model
+     * OOM-killed: the cache is ordinary anonymous memory, so it is swappable, and it
+     * grows as prompts are processed. Measured: an app server left running 11h21m had
+     * **11.3 GB of swap** attributed to it.
+     *
+     * The cache is a nicety (it saves re-processing a repeated prompt) and is not worth
+     * any of that. 1 GiB still holds roughly a dozen 8k-context prompt states, which is
+     * far more reuse than a single-user chat can generate, and it costs 1/24th of the
+     * memory. Raise it only with the model's footprint in mind: the 24B already takes
+     * 12.6 GB before any cache.
+     */
+    val cacheRamMb: Int = 1024,
     /** DSpark drafter — only exists for Bonsai-1 packs. */
     val useDraftModel: Boolean = false,
     /** MTP head grafted into the target GGUF (Bonsai-2 mtp-lean). No -md. */
