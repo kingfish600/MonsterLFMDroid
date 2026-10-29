@@ -314,11 +314,10 @@ private fun Bubble(
                         onClick = { clipboard.setText(AnnotatedString(turn.content)) },
                         modifier = Modifier.padding(0.dp),
                     ) {
-                        Icon(
-                            Icons.Filled.ContentCopy,
-                            contentDescription = "Copy",
-                            modifier = Modifier.padding(2.dp),
-                        )
+                        // Text, not an icon: an icon-only button carries no text in the
+                        // accessibility tree, so it was impossible to tell from a UI dump
+                        // whether this row rendered at all.
+                        Text("⧉ copy", style = MaterialTheme.typography.labelMedium)
                     }
                 }
             }
