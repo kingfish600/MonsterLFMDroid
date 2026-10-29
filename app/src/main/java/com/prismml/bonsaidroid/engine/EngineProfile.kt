@@ -27,7 +27,23 @@ data class EngineProfile(
     /** 0 = auto (all detected big cores). 8 Elite: 8 big cores. */
     val threads: Int = 0,
     /** GPU layers via Vulkan; 0 keeps everything on CPU (validated default). */
-    val nGpuLayers: Int = 0,
+    /**
+     * Layers offloaded to the GPU. 99 = all of them.
+     *
+     * This fork ships the OpenCL backend, which supports the Adreno 830 in the
+     * Snapdragon 8 Elite by name. Measured on the device (llama-bench, 3 reps):
+     *
+     *   24B   pp256 30.25 -> 76.86 (2.54x)   tg64 16.97 -> 20.75 (1.22x)
+     *   LFM3  pp512 92.50 -> 330.72 (3.58x)  tg128 23.41 -> 28.97 (1.24x)
+     *
+     * Decode gains least because it is memory-bandwidth-bound and the Adreno shares
+     * the same LPDDR5X as the CPU; prompt processing is compute-bound and gains most,
+     * which is what the agent loop actually pays for on every tool round.
+     *
+     * Keeping the MoE experts on the CPU (-ncmoe) was measured and is far worse:
+     * 0.41 t/s, unusable. Offload everything.
+     */
+    val nGpuLayers: Int = 99,
     val kvCacheTypeK: String = "q8_0",
     val kvCacheTypeV: String = "q8_0",
     val flashAttn: Boolean = true,

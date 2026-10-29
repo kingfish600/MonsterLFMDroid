@@ -493,11 +493,13 @@ class LlamaServerEngine(private val context: Context) : BonsaiEngine {
         // Single-user prompt cache: without this the server splits slots and
         // long chats re-process the whole prompt every turn (Bonsai-demo #183).
         if (p.cacheRamMb > 0) args += listOf("--cache-ram", p.cacheRamMb.toString())
-        // UMA auto-distribution ignores -ngl 0 and silently spreads tensors on
-        // the Adreno device, which runs PTQ1_0 on a slow fallback path. Pin it.
-        // Only name a device when we actually offload; "-device none" on a
-        // CPU-only engine produced a spurious "no usable GPU found" warning.
-        if (p.nGpuLayers > 0) args += listOf("--device", "Vulkan0")
+        // Pin the offload device explicitly. Upstream note: UMA auto-distribution
+        // ignores -ngl 0 and silently spreads tensors on the Adreno device, so the
+        // device is named whenever we actually offload. The name must match the
+        // backend actually compiled in: this fork ships the OpenCL backend, whose
+        // device is "GPUOpenCL" (an earlier Vulkan-based lineage used "Vulkan0",
+        // which this engine has no backend for and would fail to resolve).
+        if (p.nGpuLayers > 0) args += listOf("--device", "GPUOpenCL")
         if (p.threads > 0) args += listOf("-t", p.threads.toString())
         if (p.threadsBatch > 0) args += listOf("-tb", p.threadsBatch.toString())
         // Keep every worker inside one L2 cluster. Measured +26% decode versus
