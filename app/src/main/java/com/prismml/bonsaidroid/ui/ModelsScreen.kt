@@ -68,10 +68,15 @@ private fun diagnosticBundle(
 @Composable
 fun ModelsScreen(vm: AppViewModel) {
     val downloads by vm.downloadState.collectAsState()
-    // Collected purely so the screen recomposes when files are deleted or finished
-    // downloading: isDownloaded() reads the filesystem and is not observable itself,
-    // so without this a deleted model stayed on screen until a tab switch.
-    @Suppress("UNUSED_VARIABLE")
+    /**
+     * Bumped by ModelDownloader whenever a file appears or disappears.
+     *
+     * `isDownloaded()` reads the filesystem, so it is not observable by itself and a
+     * deleted model used to stay on screen until the user switched tabs. Collecting
+     * this alone was NOT enough: the value also has to be *read inside the item*, or
+     * Compose sees an unchanged item lambda and skips re-running it, so isDownloaded()
+     * is never called again. Every card therefore keys its downloaded state on this.
+     */
     val diskRevision by vm.downloader.revision.collectAsState()
     val loaded by vm.loaded.collectAsState()
     val busy by vm.busy.collectAsState()
@@ -207,6 +212,11 @@ fun ModelsScreen(vm: AppViewModel) {
         }
 
         items(ModelCatalog.assets) { asset ->
+            // Keyed on diskRevision so deleting a file actually recomputes this and
+            // recomposes the card. Without the read, Compose skips the item.
+            val downloaded = remember(asset.id, diskRevision) {
+                vm.downloader.isDownloaded(asset)
+            }
             AssetCard(
                 asset = asset,
                 selected = asset.id == selectedTarget.id && asset.kind == AssetKind.TARGET_MODEL,
@@ -214,7 +224,7 @@ fun ModelsScreen(vm: AppViewModel) {
                 // card only showed "selected", so loading or switching models gave no
                 // feedback on the card itself.
                 loaded = loaded?.target?.id == asset.id,
-                downloaded = vm.downloader.isDownloaded(asset),
+                downloaded = downloaded,
                 downloadState = downloads.takeIf { it is DownloadState.Running || it is DownloadState.Failed },
                 onSelect = { if (asset.kind == AssetKind.TARGET_MODEL) selectedTarget = asset },
                 onDownload = { vm.launchUi { vm.downloader.download(asset) } },
