@@ -35,6 +35,31 @@ object TtsEngine {
     data class Speech(val wav: File, val seconds: Double, val genSeconds: Double)
 
     /**
+     * Strips everything from [raw] that should not be read aloud.
+     *
+     * This is not cosmetic. The model is multilingual and takes its language cue
+     * partly from the text, and `turn.content` carries UI artifacts — including the
+     * citation markers `【2†L1-L4】`, which are **CJK brackets**. Handing a
+     * 19-language speech model CJK punctuation inside otherwise-English prose is a
+     * plausible reason it comes back speaking the wrong language, which is exactly
+     * what was reported. Tool notes, code fences, citation markers and markdown
+     * emphasis all go; the remaining prose is what a person would actually read out.
+     */
+    fun cleanForSpeech(raw: String): String {
+        var t = raw
+        t = t.replace(Regex("""\[[\p{So}\p{Sk}\s]*[\w ]{0,40}:.*?]"""), " ")   // [🔍 web_search: ...]
+        t = t.replace(Regex("""【[^】]*】"""), " ")                              // 【2†L1-L4】
+        t = t.replace(Regex("""\[\d+†[^\]]*]"""), " ")                         // [2†L1-L4]
+        t = t.replace(Regex("""```[\s\S]*?```"""), " ")                        // fenced code
+        t = t.replace(Regex("""`([^`]*)`"""), "$1")                            // inline code
+        t = t.replace(Regex("""\*\*([^*]*)\*\*"""), "$1")                      // bold
+        t = t.replace(Regex("""https?://\S+"""), " ")                          // bare URLs
+        t = t.replace(Regex("""^[#>\-*\s]+""", RegexOption.MULTILINE), " ")    // md bullets/heads
+        t = t.replace(Regex("""\s+"""), " ").trim()
+        return t
+    }
+
+    /**
      * Synthesises [text] to a WAV in the cache dir. Blocking work runs on IO.
      *
      * @param voice "female" (default) or "male"
@@ -49,7 +74,8 @@ object TtsEngine {
         lang: String = "en",
     ): Result<Speech> = withContext(Dispatchers.IO) {
         runCatching {
-            require(text.isNotBlank()) { "nothing to say" }
+            val spoken = cleanForSpeech(text)
+            require(spoken.isNotBlank()) { "nothing to say" }
             require(model.exists()) { "audio model missing: ${model.name}" }
             require(mmproj.exists()) { "audio mmproj missing: ${mmproj.name}" }
 
@@ -64,13 +90,14 @@ object TtsEngine {
                 exe.absolutePath,
                 "-m", model.absolutePath,
                 "-mm", mmproj.absolutePath,
-                "-p", text,
+                "-p", spoken,
                 "--tts-voice", voice,
                 "--tts-lang", lang,
                 "--output", out.absolutePath,
                 "-t", "6",
             )
             Log.i(TAG, "tts: ${cmd.joinToString(" ").take(300)}")
+            Log.i(TAG, "tts: spoke ${spoken.length} chars (from ${text.length} raw)")
 
             val pb = ProcessBuilder(cmd)
             pb.directory(context.cacheDir)
