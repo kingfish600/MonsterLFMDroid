@@ -49,6 +49,7 @@ object WebSearch {
     private const val TAG = "BonsaiDroid"
 
     private const val DDG = "https://html.duckduckgo.com/html/"
+    private const val DDG_LITE = "https://lite.duckduckgo.com/lite/"
     private const val WIKI = "https://en.wikipedia.org/w/api.php"
 
     /** A realistic Android Chrome UA. Paired with the headers below; either alone fails. */
@@ -157,6 +158,40 @@ object WebSearch {
             }.getOrNull()
         }
 
+    /**
+     * Second DDG endpoint. Same provider, different renderer — it has survived
+     * episodes where `html/` was challenged, and it needs no separate headers.
+     * Its markup differs: single-quoted attributes and `href` *before* `class`, so the
+     * regex is order- and quote-agnostic rather than assuming one layout.
+     */
+    private suspend fun duckduckgoLite(query: String, max: Int): List<Result>? =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val url = "$DDG_LITE?q=${URLEncoder.encode(query, "UTF-8")}"
+                client.newCall(browserRequest(url)).execute().use { resp ->
+                    if (!resp.isSuccessful) return@runCatching null
+                    val body = resp.body?.string().orEmpty()
+                    val links = Regex(
+                        """<a(?=[^>]*class=['"]result-link['"])(?=[^>]*href="([^"]+)")[^>]*>(.*?)</a>""",
+                        setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE),
+                    ).findAll(body).toList()
+                    val snippets = Regex(
+                        """<td[^>]*class=['"]result-snippet['"][^>]*>(.*?)</td>""",
+                        setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE),
+                    ).findAll(body).map { clean(it.groupValues[1]) }.toList()
+                    links.take(max).mapIndexedNotNull { i, m ->
+                        val u = unwrap(m.groupValues[1])
+                        if (!u.startsWith("http")) return@mapIndexedNotNull null
+                        Result(
+                            title = clean(m.groupValues[2]).take(140),
+                            url = u,
+                            snippet = (snippets.getOrNull(i) ?: "").take(MAX_SNIPPET),
+                        )
+                    }
+                }
+            }.getOrNull()
+        }
+
     private suspend fun wikipedia(query: String, max: Int): List<Result>? =
         withContext(Dispatchers.IO) {
             runCatching {
@@ -186,18 +221,21 @@ object WebSearch {
             }.getOrNull()
         }
 
-    /** Runs the search. Never throws; a total failure is reported as an error string. */
+    /** Runs the search, walking the fallback chain. Never throws. */
     suspend fun searchOutcome(query: String, max: Int = 5): SearchOutcome {
         duckduckgo(query, max)?.takeIf { it.isNotEmpty() }?.let {
-            Log.i(TAG, "web_search duckduckgo \"$query\" -> ${it.size} results")
+            Log.i(TAG, "web_search duckduckgo/html \"$query\" -> ${it.size}")
             return SearchOutcome("duckduckgo", it)
         }
-        Log.i(TAG, "web_search ddg unavailable, trying wikipedia")
+        duckduckgoLite(query, max)?.takeIf { it.isNotEmpty() }?.let {
+            Log.i(TAG, "web_search duckduckgo/lite \"$query\" -> ${it.size}")
+            return SearchOutcome("duckduckgo-lite", it)
+        }
         wikipedia(query, max)?.takeIf { it.isNotEmpty() }?.let {
-            Log.i(TAG, "web_search wikipedia \"$query\" -> ${it.size} results")
+            Log.i(TAG, "web_search wikipedia \"$query\" -> ${it.size}")
             return SearchOutcome("wikipedia", it)
         }
-        Log.i(TAG, "web_search FAILED \"$query\" - both backends empty")
+        Log.i(TAG, "web_search FAILED \"$query\" - every backend empty")
         return SearchOutcome(
             "none", emptyList(),
             error = "Search is unavailable right now (DuckDuckGo and Wikipedia both " +
