@@ -91,3 +91,31 @@ Decode falls off with context (measured): ~31 t/s at 500 tokens, ~25 at 4K,
 the window. So a harness needs either aggressive context trimming, or to keep
 tool results small, or it will spend its speed budget on context. This is the main
 engineering risk in the whole idea.
+
+## Layla AI comparison (researched 2026-10-28, at the user's suggestion)
+Layla AI is another local-first Android assistant, and the user pointed at its
+DuckDuckGo integration as the model to copy. Findings from its public SDK
+([layla-sdk](https://github.com/l3utterfly/layla-sdk)) and docs:
+
+- Agentic features come from an **"Agents" mini-app** the user installs from a
+  "Browse Apps" screen, which then activates preconfigured tools such as a
+  "DuckDuckGo News Results Agent".
+- **Mini-apps are HTML apps running in a React Native WebView**, talking to the host
+  through a WebView bridge via `@layla-network/sdk`. Their own docs say to treat them
+  as *"browser apps running in a WebView"*.
+- That is the important detail: **their DuckDuckGo calls come from a real browser
+  context**, which is why they are not challenged.
+
+**What we took from it:** the *reason* their search works, not the architecture. A
+WebView is the robust way to look like a browser; a complete browser header set
+(`Sec-Fetch-*`, `sec-ch-ua*`, `Accept-Language`, …) is the lightweight approximation,
+and it is enough — DDG answers HTTP 200 with 10 results once the request stops looking
+like a bare script. Our search is now fully on-device with that header set, and
+Wikipedia as fallback.
+
+**If DDG tightens again**, the Layla-shaped answer is a WebView-backed fetch rather
+than yet another endpoint. Worth revisiting only if the header approach starts failing.
+
+**Not copied:** Layla's mini-app/bridge architecture. It exists so third parties can
+ship HTML apps into their host. We have one app and a small fixed tool set, so a
+native tool registry is simpler and avoids a WebView in the request path.
