@@ -56,7 +56,16 @@ object TtsEngine {
         t = t.replace(Regex("""https?://\S+"""), " ")                          // bare URLs
         t = t.replace(Regex("""^[#>\-*\s]+""", RegexOption.MULTILINE), " ")    // md bullets/heads
         t = t.replace(Regex("""\s+"""), " ").trim()
-        return t
+        // Final sweep: drop anything that is not a letter, a digit, whitespace or
+        // ordinary punctuation. The rules above handle the shapes we know about; this
+        // catches the rest, so no emoji, CJK bracket, box-drawing glyph or other stray
+        // symbol reaches the model. Letters are kept by Unicode category rather than by
+        // script, so genuinely non-English prose still survives intact.
+        t = t.filter { ch ->
+            ch.isLetterOrDigit() || ch.isWhitespace() ||
+                ch in ".,!?;:'\"()[]-–—/&%$#@*+=<>"
+        }
+        return t.replace(Regex("""\s+"""), " ").trim()
     }
 
     /**
