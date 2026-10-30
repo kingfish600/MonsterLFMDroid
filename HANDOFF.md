@@ -43,8 +43,9 @@ Sustained 24B decode over 5×300 tok: 36.15 / 35.73 / 36.14 / 36.02.
 
 ### GPU offload: measured, but NOT shippable as-is
 
-> **REVERTED 2026-10-29 22:50.** The OpenCL build was removed from `jniLibs` and
-> `nGpuLayers` set back to 0. Shipping it **breaks the app**: `libggml-opencl.so` has a
+> **WORKING as of 2026-10-29 23:06.** The pair of vendor OpenCL libraries must be bundled
+> alongside `libggml-opencl.so` - see the fix note below. An earlier attempt shipped only
+> the backend and **broke the app**: `libggml-opencl.so` has a
 > `DT_NEEDED` on `libOpenCL.so`, and an Android app **cannot resolve
 > `/vendor/lib64/libOpenCL.so` for a DT_NEEDED link** - not even though it is listed in
 > `/vendor/etc/public.libraries.txt`. The engine fails to start at all:
@@ -58,9 +59,18 @@ Sustained 24B decode over 5×300 tok: 36.15 / 35.73 / 36.14 / 36.02.
 > made this look verified during development. **The app's linker namespace is not the
 > same as a shell's**, and that difference was missed.
 >
-> To re-enable, one of: bundle `libOpenCL.so` into `jniLibs` (and confirm the ICD loader
-> can still find the Adreno ICD), or load the backend via dlopen rather than DT_NEEDED.
-> Until then the numbers below are a **reference point, not a shipped feature**.
+>
+> **The fix (verified in-app):** bundle **both** `/vendor/lib64/libOpenCL.so` (87 KB) and
+> `/vendor/lib64/libOpenCL_adreno.so` (200 KB) into `jniLibs/arm64-v8a/`. It works because
+> Qualcomm's `libOpenCL.so` is itself an ICD loader (`icd.c`, `icd_linux.c`) that loads
+> `libOpenCL_adreno.so` **by name**, not by absolute path - so it finds it in the app's own
+> lib dir. And `libOpenCL_adreno.so` needs only system libraries (libcutils, libvndksupport,
+> liblog, libc++, libc, libm, libdl), so nothing else must be bundled. **Neither file alone
+> is sufficient**; the pair is. Full recipe: `/mnt/nvme4tb/shared-test/opencl-app-config.md`.
+>
+> **Do not validate this from a shell.** Running the same build from `/data/local/tmp` with
+> `LD_LIBRARY_PATH` works with nothing bundled, because a shell's linker namespace is not an
+> app's. That is exactly how this shipped broken once.
 
 llama.cpp's **OpenCL backend names the Adreno 830 in the Snapdragon 8 Elite explicitly**
 (`docs/backend/OPENCL.md`). The build now includes it (`-DGGML_OPENCL=ON`,
