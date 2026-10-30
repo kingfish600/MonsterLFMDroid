@@ -41,7 +41,26 @@ and must not test simultaneously.
 
 Sustained 24B decode over 5×300 tok: 36.15 / 35.73 / 36.14 / 36.02.
 
-### GPU offload: measured, and it works
+### GPU offload: measured, but NOT shippable as-is
+
+> **REVERTED 2026-10-29 22:50.** The OpenCL build was removed from `jniLibs` and
+> `nGpuLayers` set back to 0. Shipping it **breaks the app**: `libggml-opencl.so` has a
+> `DT_NEEDED` on `libOpenCL.so`, and an Android app **cannot resolve
+> `/vendor/lib64/libOpenCL.so` for a DT_NEEDED link** - not even though it is listed in
+> `/vendor/etc/public.libraries.txt`. The engine fails to start at all:
+>
+> ```
+> CANNOT LINK EXECUTABLE "libllamaserver.so": library "libOpenCL.so" not found:
+>   needed by ".../libggml-opencl.so" in namespace (default)
+> ```
+>
+> A headless run from `/data/local/tmp` with `LD_LIBRARY_PATH` works fine - that is what
+> made this look verified during development. **The app's linker namespace is not the
+> same as a shell's**, and that difference was missed.
+>
+> To re-enable, one of: bundle `libOpenCL.so` into `jniLibs` (and confirm the ICD loader
+> can still find the Adreno ICD), or load the backend via dlopen rather than DT_NEEDED.
+> Until then the numbers below are a **reference point, not a shipped feature**.
 
 llama.cpp's **OpenCL backend names the Adreno 830 in the Snapdragon 8 Elite explicitly**
 (`docs/backend/OPENCL.md`). The build now includes it (`-DGGML_OPENCL=ON`,

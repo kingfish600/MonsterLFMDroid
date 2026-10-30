@@ -28,22 +28,26 @@ data class EngineProfile(
     val threads: Int = 0,
     /** GPU layers via Vulkan; 0 keeps everything on CPU (validated default). */
     /**
-     * Layers offloaded to the GPU. 99 = all of them.
+     * Layers offloaded to the GPU. 0 = CPU only.
      *
-     * This fork ships the OpenCL backend, which supports the Adreno 830 in the
-     * Snapdragon 8 Elite by name. Measured on the device (llama-bench, 3 reps):
+     * **Kept at 0 deliberately.** The OpenCL backend works and is measurably faster
+     * (see below), but shipping it breaks the app: libggml-opencl.so has a DT_NEEDED on
+     * libOpenCL.so, and an Android app cannot resolve /vendor/lib64/libOpenCL.so for a
+     * DT_NEEDED link - not even though it is listed in /vendor/etc/public.libraries.txt.
+     * The engine then fails to start entirely:
+     *   CANNOT LINK EXECUTABLE "libllamaserver.so": library "libOpenCL.so" not found
+     * A headless run from /data/local/tmp with LD_LIBRARY_PATH works, which is what made
+     * this look fine during development; the app's linker namespace is not the same.
      *
-     *   24B   pp256 30.25 -> 76.86 (2.54x)   tg64 16.97 -> 20.75 (1.22x)
+     * To re-enable: libOpenCL.so must be bundled into jniLibs (and must then be able to
+     * find the Adreno ICD), or the backend must be dlopen'd rather than DT_NEEDED.
+     *
+     * Measured when it did run, llama-bench, 3 reps, governors on walt:
+     *   24B   pp256 30.25 -> 76.86 (2.54x)   tg64  16.97 -> 20.75 (1.22x)
      *   LFM3  pp512 92.50 -> 330.72 (3.58x)  tg128 23.41 -> 28.97 (1.24x)
-     *
-     * Decode gains least because it is memory-bandwidth-bound and the Adreno shares
-     * the same LPDDR5X as the CPU; prompt processing is compute-bound and gains most,
-     * which is what the agent loop actually pays for on every tool round.
-     *
-     * Keeping the MoE experts on the CPU (-ncmoe) was measured and is far worse:
-     * 0.41 t/s, unusable. Offload everything.
+     * Keeping MoE experts on CPU (-ncmoe) measured 0.41 t/s - unusable.
      */
-    val nGpuLayers: Int = 99,
+    val nGpuLayers: Int = 0,
     val kvCacheTypeK: String = "q8_0",
     val kvCacheTypeV: String = "q8_0",
     val flashAttn: Boolean = true,
