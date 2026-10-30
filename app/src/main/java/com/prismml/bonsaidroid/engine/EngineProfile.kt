@@ -47,7 +47,7 @@ data class EngineProfile(
      *   LFM3  pp512 92.50 -> 330.72 (3.58x)  tg128 23.41 -> 28.97 (1.24x)
      * Keeping MoE experts on CPU (-ncmoe) measured 0.41 t/s - unusable.
      */
-    val nGpuLayers: Int = 0,
+    val nGpuLayers: Int = 99,
     val kvCacheTypeK: String = "q8_0",
     val kvCacheTypeV: String = "q8_0",
     val flashAttn: Boolean = true,
